@@ -20,7 +20,7 @@ namespace MEngine::RenderBackend::Vulkan {
 
 class VulkanRHI::Impl {
 public:
-    void initialize(SDL_Window* window, const char* applicationName)
+    void initialize(SDL_Window* window, const char* applicationName, bool enableRayTracing)
     {
         if (!window) {
             throw std::runtime_error("Vulkan requires a valid SDL window handle");
@@ -28,7 +28,7 @@ public:
 
         window_ = window;
         device = std::make_unique<VulkanDevice>();
-        device->initialize(window, applicationName);
+        device->initialize(window, applicationName, enableRayTracing);
 
         swapchain = std::make_unique<VulkanSwapchain>();
         swapchain->initialize(*device, window);
@@ -37,7 +37,7 @@ public:
         commandContext->initialize(*device);
 
         renderer = std::make_unique<VulkanRenderer>();
-        renderer->initialize(*device, *swapchain, window_);
+        renderer->initialize(*device, *swapchain, window_, device->rayTracingEnabled());
 
         renderThread = std::make_unique<VulkanRenderThread>();
         renderThread->start();
@@ -183,6 +183,18 @@ public:
         }
     }
 
+    void setDynamicPrimitiveInstances(const std::vector<PrimitiveInstance>& primitives)
+    {
+        if (renderer) {
+            renderer->setDynamicPrimitiveInstances(primitives);
+        }
+    }
+
+    [[nodiscard]] bool shootingModeEnabled() const
+    {
+        return renderer && renderer->shootingModeEnabled();
+    }
+
     [[nodiscard]] nvrhi::DeviceHandle nvrhiDevice() const
     {
         return device ? device->nvrhiDevice() : nullptr;
@@ -206,9 +218,9 @@ VulkanRHI::VulkanRHI()
 
 VulkanRHI::~VulkanRHI() = default;
 
-void VulkanRHI::initialize(void* nativeWindowHandle, const char* applicationName)
+void VulkanRHI::initialize(void* nativeWindowHandle, const char* applicationName, bool enableRayTracing)
 {
-    impl_->initialize(static_cast<SDL_Window*>(nativeWindowHandle), applicationName);
+    impl_->initialize(static_cast<SDL_Window*>(nativeWindowHandle), applicationName, enableRayTracing);
 }
 
 void VulkanRHI::beginFrame()
@@ -224,6 +236,16 @@ void VulkanRHI::endFrame(const Camera::CameraState* camera)
 void VulkanRHI::setPrimitiveInstances(const std::vector<PrimitiveInstance>& primitives)
 {
     impl_->setPrimitiveInstances(primitives);
+}
+
+void VulkanRHI::setDynamicPrimitiveInstances(const std::vector<PrimitiveInstance>& primitives)
+{
+    impl_->setDynamicPrimitiveInstances(primitives);
+}
+
+bool VulkanRHI::shootingModeEnabled() const
+{
+    return impl_->shootingModeEnabled();
 }
 
 void VulkanRHI::shutdown()

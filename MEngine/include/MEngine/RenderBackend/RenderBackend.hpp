@@ -18,10 +18,12 @@ public:
     Renderer(const Renderer&) = delete;
     Renderer& operator=(const Renderer&) = delete;
 
-    void initialize(const std::string& applicationName, int width, int height, GraphicsApi graphicsApi, void* nativeWindowHandle);
+    void initialize(const std::string& applicationName, int width, int height, GraphicsApi graphicsApi, void* nativeWindowHandle, bool enableRayTracing);
     void beginFrame();
     void endFrame(const MEngine::Camera::CameraState& camera);
     void setPrimitiveInstances(const std::vector<PrimitiveInstance>& primitives);
+    void setDynamicPrimitiveInstances(const std::vector<PrimitiveInstance>& primitives);
+    [[nodiscard]] bool shootingModeEnabled() const;
     void shutdown();
 
 private:

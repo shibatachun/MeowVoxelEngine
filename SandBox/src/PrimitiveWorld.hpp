@@ -2,7 +2,10 @@
 
 #include "MEngine/RenderBackend/Primitive.hpp"
 
+#include <TaskScheduler.h>
+
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace SandBox {
@@ -13,8 +16,9 @@ struct PrimitiveWorldConfig {
     int worldSizeChunks = 4096;
     int chunkSize = 16;
     float cellSize = 0.95f;
-    float noiseFrequency = 0.085f;
-    float heightScale = 7.0f;
+    float noiseFrequency = 0.052f;
+    float heightScale = 22.0f;
+    float waterLine = 0.34f;
 };
 
 struct ChunkCoord {
@@ -44,8 +48,12 @@ private:
 class PrimitiveWorldStreamer {
 public:
     explicit PrimitiveWorldStreamer(PrimitiveWorldConfig config);
+    ~PrimitiveWorldStreamer();
 
     [[nodiscard]] bool update(float cameraX, float cameraZ);
+    // Blocks only when the caller explicitly wants a completed world snapshot,
+    // currently used for the first frame so startup does not render empty terrain.
+    [[nodiscard]] bool waitForPendingLoad();
     [[nodiscard]] const std::vector<MEngine::RenderBackend::PrimitiveInstance>& visiblePrimitives() const;
     [[nodiscard]] ChunkCoord centerChunk() const;
     [[nodiscard]] int loadedChunkCount() const;
@@ -54,10 +62,17 @@ public:
 private:
     [[nodiscard]] ChunkCoord chunkFromWorldPosition(float worldX, float worldZ) const;
     [[nodiscard]] bool isInsideWorld(ChunkCoord coord) const;
-    void rebuildVisibleChunks(ChunkCoord center);
+    void requestVisibleChunks(ChunkCoord center);
+    [[nodiscard]] bool publishCompletedRequest();
 
     PrimitiveWorldConfig config_;
     PrimitiveWorldGenerator generator_;
+    // CPU terrain generation lives on enkiTS workers; rendering consumes only
+    // completed primitive snapshots on the main thread.
+    enki::TaskScheduler taskScheduler_;
+    class RebuildVisibleChunksTask;
+    std::unique_ptr<RebuildVisibleChunksTask> activeTask_;
+    ChunkCoord requestedCenterChunk_ { 2147483647, 2147483647 };
     ChunkCoord centerChunk_ { 2147483647, 2147483647 };
     int loadedChunkCount_ = 0;
     std::vector<MEngine::RenderBackend::PrimitiveInstance> visiblePrimitives_;

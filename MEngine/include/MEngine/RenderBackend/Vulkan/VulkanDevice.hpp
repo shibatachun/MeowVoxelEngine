@@ -19,7 +19,7 @@ public:
     VulkanDevice(const VulkanDevice&) = delete;
     VulkanDevice& operator=(const VulkanDevice&) = delete;
 
-    void initialize(SDL_Window* window, const char* applicationName);
+    void initialize(SDL_Window* window, const char* applicationName, bool requestRayTracing);
     void shutdown();
 
     [[nodiscard]] VkInstance instance() const;
@@ -29,6 +29,9 @@ public:
     [[nodiscard]] VkQueue graphicsQueue() const;
     [[nodiscard]] uint32_t graphicsQueueFamily() const;
     [[nodiscard]] const std::string& physicalDeviceName() const;
+    [[nodiscard]] bool rayTracingEnabled() const;
+    [[nodiscard]] bool samplerAnisotropyEnabled() const;
+    [[nodiscard]] float maxSamplerAnisotropy() const;
     [[nodiscard]] nvrhi::DeviceHandle nvrhiDevice() const;
 
 private:
@@ -39,6 +42,7 @@ private:
     void createNvrhiDevice();
 
     [[nodiscard]] bool supportsDeviceExtension(VkPhysicalDevice device, const char* extensionName) const;
+    [[nodiscard]] bool supportsRayTracingExtensions(VkPhysicalDevice device) const;
     [[nodiscard]] bool findGraphicsQueue(VkPhysicalDevice device, uint32_t& queueFamilyIndex) const;
 
     VkInstance instance_ = VK_NULL_HANDLE;
@@ -52,6 +56,10 @@ private:
     std::vector<const char*> deviceExtensions_;
     nvrhi::IMessageCallback* nvrhiMessageCallback_ = nullptr;
     nvrhi::DeviceHandle nvrhiDevice_;
+    bool requestRayTracing_ = false;
+    bool rayTracingEnabled_ = false;
+    bool samplerAnisotropyEnabled_ = false;
+    float maxSamplerAnisotropy_ = 1.0f;
 };
 
 } // namespace MEngine::RenderBackend::Vulkan

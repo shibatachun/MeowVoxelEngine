@@ -45,12 +45,14 @@ VulkanDevice::~VulkanDevice()
     shutdown();
 }
 
-void VulkanDevice::initialize(SDL_Window* window, const char* applicationName)
+void VulkanDevice::initialize(SDL_Window* window, const char* applicationName, bool requestRayTracing)
 {
     if (!window) {
         throw std::runtime_error("Vulkan requires a valid SDL window handle");
     }
 
+    requestRayTracing_ = requestRayTracing;
+    rayTracingEnabled_ = false;
     createInstance(applicationName);
     createSurface(window);
     selectPhysicalDevice();
@@ -86,6 +88,9 @@ VkDevice VulkanDevice::device() const { return device_; }
 VkQueue VulkanDevice::graphicsQueue() const { return graphicsQueue_; }
 uint32_t VulkanDevice::graphicsQueueFamily() const { return graphicsQueueFamily_; }
 const std::string& VulkanDevice::physicalDeviceName() const { return physicalDeviceName_; }
+bool VulkanDevice::rayTracingEnabled() const { return rayTracingEnabled_; }
+bool VulkanDevice::samplerAnisotropyEnabled() const { return samplerAnisotropyEnabled_; }
+float VulkanDevice::maxSamplerAnisotropy() const { return maxSamplerAnisotropy_; }
 nvrhi::DeviceHandle VulkanDevice::nvrhiDevice() const { return nvrhiDevice_; }
 
 void VulkanDevice::createInstance(const char* applicationName)
@@ -135,6 +140,16 @@ bool VulkanDevice::supportsDeviceExtension(VkPhysicalDevice device, const char* 
     });
 }
 
+bool VulkanDevice::supportsRayTracingExtensions(VkPhysicalDevice device) const
+{
+    return supportsDeviceExtension(device, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
+        supportsDeviceExtension(device, VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME) &&
+        supportsDeviceExtension(device, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME) &&
+        supportsDeviceExtension(device, VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME) &&
+        supportsDeviceExtension(device, VK_KHR_SPIRV_1_4_EXTENSION_NAME) &&
+        supportsDeviceExtension(device, VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME);
+}
+
 bool VulkanDevice::findGraphicsQueue(VkPhysicalDevice device, uint32_t& queueFamilyIndex) const
 {
     uint32_t queueFamilyCount = 0;
@@ -175,6 +190,10 @@ void VulkanDevice::selectPhysicalDevice()
         if (!findGraphicsQueue(candidate, candidateQueueFamily)) {
             continue;
         }
+        if (requestRayTracing_ && !supportsRayTracingExtensions(candidate)) {
+            MENGINE_WARN("[RenderBackend] Vulkan device candidate skipped: missing KHR ray tracing extensions");
+            continue;
+        }
 
         physicalDevice_ = candidate;
         graphicsQueueFamily_ = candidateQueueFamily;
@@ -182,15 +201,26 @@ void VulkanDevice::selectPhysicalDevice()
         VkPhysicalDeviceProperties properties {};
         vkGetPhysicalDeviceProperties(physicalDevice_, &properties);
         physicalDeviceName_ = properties.deviceName;
+        maxSamplerAnisotropy_ = properties.limits.maxSamplerAnisotropy;
         return;
     }
 
-    throw std::runtime_error("No Vulkan physical device supports graphics + present + swapchain");
+    throw std::runtime_error(requestRayTracing_
+            ? "No Vulkan physical device supports graphics + present + swapchain + KHR ray tracing"
+            : "No Vulkan physical device supports graphics + present + swapchain");
 }
 
 void VulkanDevice::createLogicalDevice()
 {
     deviceExtensions_.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    if (requestRayTracing_) {
+        deviceExtensions_.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+        deviceExtensions_.push_back(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME);
+        deviceExtensions_.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
+        deviceExtensions_.push_back(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
+        deviceExtensions_.push_back(VK_KHR_SPIRV_1_4_EXTENSION_NAME);
+        deviceExtensions_.push_back(VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME);
+    }
 
     const float queuePriority = 1.0f;
     VkDeviceQueueCreateInfo queueCreateInfo {};
@@ -199,13 +229,34 @@ void VulkanDevice::createLogicalDevice()
     queueCreateInfo.queueCount = 1;
     queueCreateInfo.pQueuePriorities = &queuePriority;
 
+    VkPhysicalDeviceFeatures supportedFeatures {};
+    vkGetPhysicalDeviceFeatures(physicalDevice_, &supportedFeatures);
+
     VkPhysicalDeviceFeatures features {};
+    features.samplerAnisotropy = supportedFeatures.samplerAnisotropy;
+    samplerAnisotropyEnabled_ = supportedFeatures.samplerAnisotropy == VK_TRUE;
+    VkPhysicalDeviceBufferDeviceAddressFeatures bufferDeviceAddressFeatures {};
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR accelerationStructureFeatures {};
+    VkPhysicalDeviceRayTracingPipelineFeaturesKHR rayTracingPipelineFeatures {};
+    if (requestRayTracing_) {
+        rayTracingPipelineFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR;
+        rayTracingPipelineFeatures.rayTracingPipeline = VK_TRUE;
+
+        accelerationStructureFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
+        accelerationStructureFeatures.accelerationStructure = VK_TRUE;
+        accelerationStructureFeatures.pNext = &rayTracingPipelineFeatures;
+
+        bufferDeviceAddressFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
+        bufferDeviceAddressFeatures.bufferDeviceAddress = VK_TRUE;
+        bufferDeviceAddressFeatures.pNext = &accelerationStructureFeatures;
+    }
 
     VkDeviceCreateInfo createInfo {};
     createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     createInfo.queueCreateInfoCount = 1;
     createInfo.pQueueCreateInfos = &queueCreateInfo;
     createInfo.pEnabledFeatures = &features;
+    createInfo.pNext = requestRayTracing_ ? &bufferDeviceAddressFeatures : nullptr;
     createInfo.enabledExtensionCount = static_cast<uint32_t>(deviceExtensions_.size());
     createInfo.ppEnabledExtensionNames = deviceExtensions_.data();
 
@@ -213,6 +264,10 @@ void VulkanDevice::createLogicalDevice()
 
     vkGetDeviceQueue(device_, graphicsQueueFamily_, 0, &graphicsQueue_);
     VULKAN_HPP_DEFAULT_DISPATCHER.init(instance_, vkGetInstanceProcAddr, device_);
+    rayTracingEnabled_ = requestRayTracing_;
+    if (rayTracingEnabled_) {
+        MENGINE_INFO("[RenderBackend] Vulkan KHR ray tracing extensions enabled");
+    }
 }
 
 void VulkanDevice::createNvrhiDevice()
@@ -227,6 +282,7 @@ void VulkanDevice::createNvrhiDevice()
     desc.numInstanceExtensions = instanceExtensions_.size();
     desc.deviceExtensions = deviceExtensions_.data();
     desc.numDeviceExtensions = deviceExtensions_.size();
+    desc.bufferDeviceAddressSupported = rayTracingEnabled_;
     nvrhiMessageCallback_ = &g_NvrhiMessageCallback;
     desc.errorCB = nvrhiMessageCallback_;
 

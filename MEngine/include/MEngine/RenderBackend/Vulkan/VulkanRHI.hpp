@@ -14,10 +14,12 @@ public:
     VulkanRHI(const VulkanRHI&) = delete;
     VulkanRHI& operator=(const VulkanRHI&) = delete;
 
-    void initialize(void* nativeWindowHandle, const char* applicationName) override;
+    void initialize(void* nativeWindowHandle, const char* applicationName, bool enableRayTracing) override;
     void beginFrame() override;
     void endFrame(const Camera::CameraState* camera = nullptr) override;
     void setPrimitiveInstances(const std::vector<PrimitiveInstance>& primitives) override;
+    void setDynamicPrimitiveInstances(const std::vector<PrimitiveInstance>& primitives) override;
+    [[nodiscard]] bool shootingModeEnabled() const override;
     void shutdown() override;
 
     [[nodiscard]] nvrhi::DeviceHandle device() const override;

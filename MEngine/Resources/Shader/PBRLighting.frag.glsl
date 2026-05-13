@@ -22,6 +22,9 @@ layout(binding = 5) uniform LightingConstants
     vec4 pointLightColorAndIntensity[4];
     vec4 skyParameters;
     vec4 cloudParameters;
+    vec4 cloudWindParameters;
+    vec4 waterParameters;
+    vec4 waterWindParameters;
     vec4 cameraParameters;
 } lighting;
 
@@ -91,6 +94,13 @@ void main()
     }
 
     vec3 worldPosition = packedPosition.xyz;
+    float waterLevel = lighting.waterParameters.x;
+    bool cameraUnderwater = lighting.cameraPosition.y < waterLevel;
+    bool fragmentUnderwater = worldPosition.y < waterLevel;
+    if (!cameraUnderwater && fragmentUnderwater) {
+        discard;
+    }
+
     vec3 normal = normalize(texture(sampler2D(g_Normal, g_Sampler), v_UV).xyz * 2.0 - 1.0);
     vec3 albedo = pow(texture(sampler2D(g_Albedo, g_Sampler), v_UV).rgb, vec3(2.2));
     vec4 material = texture(sampler2D(g_Material, g_Sampler), v_UV);
@@ -112,6 +122,14 @@ void main()
         float attenuation = 1.0 / max(distanceToLight * distanceToLight, 0.0001);
         vec3 radiance = lighting.pointLightColorAndIntensity[i].rgb * lighting.pointLightColorAndIntensity[i].a * attenuation;
         color += evaluatePbrLight(albedo, metallic, roughness, normal, viewDirection, lightDirection, radiance);
+    }
+
+    if (cameraUnderwater && fragmentUnderwater) {
+        float viewDistance = length(worldPosition - lighting.cameraPosition.xyz);
+        vec3 waterTint = vec3(0.02, 0.28, 0.36);
+        vec3 absorption = exp(-vec3(0.18, 0.06, 0.025) * viewDistance);
+        float haze = 1.0 - exp(-viewDistance * 0.08);
+        color = color * absorption + waterTint * haze * lighting.skyParameters.z;
     }
 
     out_Color = vec4(tonemap(color), 1.0);

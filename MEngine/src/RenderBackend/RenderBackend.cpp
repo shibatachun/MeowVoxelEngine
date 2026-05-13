@@ -59,7 +59,7 @@ Renderer::~Renderer()
     shutdown();
 }
 
-void Renderer::initialize(const std::string& applicationName, int width, int height, GraphicsApi graphicsApi, void* nativeWindowHandle)
+void Renderer::initialize(const std::string& applicationName, int width, int height, GraphicsApi graphicsApi, void* nativeWindowHandle, bool enableRayTracing)
 {
     const nvrhi::GraphicsAPI nvrhiGraphicsApi = toNvrhiGraphicsApi(graphicsApi);
     backendName_ = graphicsApiName(nvrhiGraphicsApi);
@@ -69,10 +69,13 @@ void Renderer::initialize(const std::string& applicationName, int width, int hei
         nvrhi::c_HeaderVersion,
         nvrhi::verifyHeaderVersion(),
         backendName_);
+    if (enableRayTracing) {
+        MENGINE_INFO("[RenderBackend] Ray tracing pipeline requested");
+    }
 
     rhiContext_ = createRHIContext(graphicsApi);
     if (rhiContext_) {
-        rhiContext_->initialize(nativeWindowHandle, applicationName.c_str());
+        rhiContext_->initialize(nativeWindowHandle, applicationName.c_str(), enableRayTracing);
     } else {
         MENGINE_WARN("[RenderBackend] {} device creation is not implemented yet; using placeholder backend state", backendName_);
     }
@@ -105,6 +108,18 @@ void Renderer::setPrimitiveInstances(const std::vector<PrimitiveInstance>& primi
     if (initialized_ && rhiContext_) {
         rhiContext_->setPrimitiveInstances(primitives);
     }
+}
+
+void Renderer::setDynamicPrimitiveInstances(const std::vector<PrimitiveInstance>& primitives)
+{
+    if (initialized_ && rhiContext_) {
+        rhiContext_->setDynamicPrimitiveInstances(primitives);
+    }
+}
+
+bool Renderer::shootingModeEnabled() const
+{
+    return initialized_ && rhiContext_ && rhiContext_->shootingModeEnabled();
 }
 
 void Renderer::shutdown()

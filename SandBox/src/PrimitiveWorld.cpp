@@ -5,6 +5,7 @@
 #include <cmath>
 #include <numeric>
 #include <random>
+#include <utility>
 
 namespace SandBox {
 
@@ -18,6 +19,12 @@ float fade(float value)
 float lerp(float a, float b, float t)
 {
     return a + (b - a) * t;
+}
+
+float smoothstep(float edge0, float edge1, float value)
+{
+    const float t = std::clamp((value - edge0) / (edge1 - edge0), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
 }
 
 float grad(int hash, float x, float z)
@@ -44,14 +51,14 @@ float grad(int hash, float x, float z)
 
 void setColorForHeight(MEngine::RenderBackend::PrimitiveInstance& primitive, float normalizedHeight)
 {
-    if (normalizedHeight < 0.28f) {
-        primitive.color[0] = 0.18f;
-        primitive.color[1] = 0.42f;
-        primitive.color[2] = 0.95f;
+    if (normalizedHeight < 0.30f) {
+        primitive.color[0] = 0.30f;
+        primitive.color[1] = 0.28f;
+        primitive.color[2] = 0.20f;
         return;
     }
 
-    if (normalizedHeight < 0.42f) {
+    if (normalizedHeight < 0.46f) {
         primitive.color[0] = 0.36f;
         primitive.color[1] = 0.78f;
         primitive.color[2] = 0.32f;
@@ -74,15 +81,69 @@ float sampleHeight01(const PrimitiveWorldGenerator& generator, const PrimitiveWo
 {
     const float sampleX = static_cast<float>(worldX) * config.noiseFrequency;
     const float sampleZ = static_cast<float>(worldZ) * config.noiseFrequency;
-    return std::clamp(generator.fractalNoise(sampleX, sampleZ) * 0.5f + 0.5f, 0.0f, 1.0f);
+    const float continent = generator.fractalNoise(sampleX * 0.36f, sampleZ * 0.36f) * 0.5f + 0.5f;
+    const float hills = generator.fractalNoise(sampleX, sampleZ) * 0.5f + 0.5f;
+    const float ridges = 1.0f - std::abs(generator.fractalNoise(sampleX * 1.9f + 41.0f, sampleZ * 1.9f - 17.0f));
+    const float mountainMask = smoothstep(0.48f, 0.88f, continent);
+    const float valleyCut = smoothstep(0.20f, 0.72f, continent);
+    const float height = hills * 0.42f + ridges * ridges * mountainMask * 0.55f + valleyCut * 0.18f;
+    return std::clamp(height, 0.0f, 1.0f);
 }
 
 int sampleBlockHeight(const PrimitiveWorldGenerator& generator, const PrimitiveWorldConfig& config, int worldX, int worldZ)
 {
-    return static_cast<int>(std::floor(sampleHeight01(generator, config, worldX, worldZ) * config.heightScale));
+    return static_cast<int>(std::floor((sampleHeight01(generator, config, worldX, worldZ) - config.waterLine) * config.heightScale));
 }
 
 } // namespace
+
+struct PrimitiveWorldStreamer::RebuildVisibleChunksTask : enki::ITaskSet {
+    struct ChunkResult {
+        ChunkCoord coord;
+        std::vector<MEngine::RenderBackend::PrimitiveInstance> primitives;
+    };
+
+    RebuildVisibleChunksTask(PrimitiveWorldConfig config, PrimitiveWorldGenerator generator, ChunkCoord center)
+        : enki::ITaskSet(1)
+        , config(std::move(config))
+        , generator(std::move(generator))
+        , center(center)
+    {
+        // Precompute the chunk list on the caller thread; worker ranges can then
+        // write to unique result slots without locks.
+        const int halfWorld = config.worldSizeChunks / 2;
+        for (int dz = -config.viewDistanceChunks; dz <= config.viewDistanceChunks; ++dz) {
+            for (int dx = -config.viewDistanceChunks; dx <= config.viewDistanceChunks; ++dx) {
+                const ChunkCoord coord { center.x + dx, center.z + dz };
+                if (coord.x < -halfWorld || coord.x >= halfWorld || coord.z < -halfWorld || coord.z >= halfWorld) {
+                    continue;
+                }
+
+                chunkCoords.push_back(coord);
+            }
+        }
+
+        chunkResults.resize(chunkCoords.size());
+        // One task item per chunk keeps the async boundary coarse enough to avoid
+        // scheduling overhead while still spreading terrain generation.
+        m_SetSize = static_cast<uint32_t>(chunkCoords.size());
+        m_MinRange = 1;
+    }
+
+    void ExecuteRange(enki::TaskSetPartition range, uint32_t) override
+    {
+        for (uint32_t index = range.start; index < range.end; ++index) {
+            chunkResults[index].coord = chunkCoords[index];
+            chunkResults[index].primitives = generator.generateChunk(config, chunkCoords[index]);
+        }
+    }
+
+    PrimitiveWorldConfig config;
+    PrimitiveWorldGenerator generator;
+    ChunkCoord center;
+    std::vector<ChunkCoord> chunkCoords;
+    std::vector<ChunkResult> chunkResults;
+};
 
 PrimitiveWorldGenerator::PrimitiveWorldGenerator(uint32_t seed)
 {
@@ -194,17 +255,39 @@ PrimitiveWorldStreamer::PrimitiveWorldStreamer(PrimitiveWorldConfig config)
     : config_(config)
     , generator_(config.seed)
 {
+    taskScheduler_.Initialize();
+}
+
+PrimitiveWorldStreamer::~PrimitiveWorldStreamer()
+{
+    if (activeTask_) {
+        taskScheduler_.WaitforTask(activeTask_.get());
+        activeTask_.reset();
+    }
+    taskScheduler_.WaitforAllAndShutdown();
 }
 
 bool PrimitiveWorldStreamer::update(float cameraX, float cameraZ)
 {
-    const ChunkCoord center = chunkFromWorldPosition(cameraX, cameraZ);
-    if (center == centerChunk_) {
+    requestedCenterChunk_ = chunkFromWorldPosition(cameraX, cameraZ);
+
+    const bool publishedCompletedRequest = publishCompletedRequest();
+    // Keep the old visible terrain until the new center chunk finishes loading.
+    if (!activeTask_ && !(requestedCenterChunk_ == centerChunk_)) {
+        requestVisibleChunks(requestedCenterChunk_);
+    }
+
+    return publishedCompletedRequest;
+}
+
+bool PrimitiveWorldStreamer::waitForPendingLoad()
+{
+    if (!activeTask_) {
         return false;
     }
 
-    rebuildVisibleChunks(center);
-    return true;
+    taskScheduler_.WaitforTask(activeTask_.get());
+    return publishCompletedRequest();
 }
 
 const std::vector<MEngine::RenderBackend::PrimitiveInstance>& PrimitiveWorldStreamer::visiblePrimitives() const
@@ -242,28 +325,50 @@ bool PrimitiveWorldStreamer::isInsideWorld(ChunkCoord coord) const
     return coord.x >= -halfWorld && coord.x < halfWorld && coord.z >= -halfWorld && coord.z < halfWorld;
 }
 
-void PrimitiveWorldStreamer::rebuildVisibleChunks(ChunkCoord center)
+void PrimitiveWorldStreamer::requestVisibleChunks(ChunkCoord center)
 {
-    visiblePrimitives_.clear();
-    loadedChunkCount_ = 0;
-    centerChunk_ = center;
-
-    const int chunkDiameter = config_.viewDistanceChunks * 2 + 1;
-    visiblePrimitives_.reserve(static_cast<size_t>(
-        chunkDiameter * chunkDiameter * config_.chunkSize * config_.chunkSize));
-
-    for (int dz = -config_.viewDistanceChunks; dz <= config_.viewDistanceChunks; ++dz) {
-        for (int dx = -config_.viewDistanceChunks; dx <= config_.viewDistanceChunks; ++dx) {
-            const ChunkCoord coord { center.x + dx, center.z + dz };
-            if (!isInsideWorld(coord)) {
-                continue;
-            }
-
-            std::vector<MEngine::RenderBackend::PrimitiveInstance> chunk = generator_.generateChunk(config_, coord);
-            visiblePrimitives_.insert(visiblePrimitives_.end(), chunk.begin(), chunk.end());
-            ++loadedChunkCount_;
-        }
+    activeTask_ = std::make_unique<RebuildVisibleChunksTask>(config_, generator_, center);
+    if (activeTask_->m_SetSize == 0) {
+        visiblePrimitives_.clear();
+        loadedChunkCount_ = 0;
+        centerChunk_ = center;
+        activeTask_.reset();
+        return;
     }
+
+    taskScheduler_.AddTaskSetToPipe(activeTask_.get());
+}
+
+bool PrimitiveWorldStreamer::publishCompletedRequest()
+{
+    if (!activeTask_ || !activeTask_->GetIsComplete()) {
+        return false;
+    }
+
+    taskScheduler_.WaitforTask(activeTask_.get());
+    if (!(activeTask_->center == requestedCenterChunk_)) {
+        // Camera moved again while this task was running; discard stale terrain
+        // and let update() request the current center on the next pass.
+        activeTask_.reset();
+        return false;
+    }
+
+    size_t primitiveCount = 0;
+    for (const RebuildVisibleChunksTask::ChunkResult& result : activeTask_->chunkResults) {
+        primitiveCount += result.primitives.size();
+    }
+
+    std::vector<MEngine::RenderBackend::PrimitiveInstance> loadedPrimitives;
+    loadedPrimitives.reserve(primitiveCount);
+    for (const RebuildVisibleChunksTask::ChunkResult& result : activeTask_->chunkResults) {
+        loadedPrimitives.insert(loadedPrimitives.end(), result.primitives.begin(), result.primitives.end());
+    }
+
+    visiblePrimitives_ = std::move(loadedPrimitives);
+    loadedChunkCount_ = static_cast<int>(activeTask_->chunkResults.size());
+    centerChunk_ = activeTask_->center;
+    activeTask_.reset();
+    return true;
 }
 
 } // namespace SandBox

@@ -9,6 +9,7 @@
 #include "MEngine/RenderBackend/RenderBackend.hpp"
 
 #include <SDL3/SDL.h>
+#include <glm/vec3.hpp>
 
 #include <utility>
 
@@ -51,7 +52,8 @@ void Engine::initialize()
         impl_->config.viewportWidth,
         impl_->config.viewportHeight,
         impl_->config.graphicsApi,
-        impl_->config.nativeWindowHandle);
+        impl_->config.nativeWindowHandle,
+        impl_->config.enableRayTracing);
     impl_->camera.initialize(static_cast<SDL_Window*>(impl_->config.nativeWindowHandle));
     impl_->physicsWorld.initialize();
     impl_->audioSystem.initialize();
@@ -75,6 +77,7 @@ void Engine::tick(float deltaSeconds)
     impl_->audioSystem.update();
 
     impl_->renderer.beginFrame();
+    impl_->renderer.setDynamicPrimitiveInstances(impl_->physicsWorld.dynamicPrimitives());
     impl_->renderer.endFrame(impl_->camera.state());
 }
 
@@ -83,9 +86,27 @@ const Camera::CameraState& Engine::cameraState() const
     return impl_->camera.state();
 }
 
+bool Engine::shootingModeEnabled() const
+{
+    return impl_->renderer.shootingModeEnabled();
+}
+
 void Engine::setPrimitiveWorld(const std::vector<RenderBackend::PrimitiveInstance>& primitives)
 {
+    impl_->physicsWorld.setTerrainColliders(primitives);
     impl_->renderer.setPrimitiveInstances(primitives);
+}
+
+void Engine::setInteractivePrimitives(const std::vector<RenderBackend::PrimitiveInstance>& primitives)
+{
+    impl_->physicsWorld.setInteractiveColliders(primitives);
+}
+
+void Engine::shootPhysicsSphere(const float origin[3], const float direction[3])
+{
+    impl_->physicsWorld.shootSphere(
+        glm::vec3(origin[0], origin[1], origin[2]),
+        glm::vec3(direction[0], direction[1], direction[2]));
 }
 
 void Engine::shutdown()

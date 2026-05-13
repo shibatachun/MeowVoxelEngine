@@ -20,6 +20,7 @@ struct EngineConfig {
     int viewportHeight = 720;
     GraphicsApi graphicsApi = GraphicsApi::D3D12;
     void* nativeWindowHandle = nullptr;
+    bool enableRayTracing = false;
 };
 
 class Engine {
@@ -33,7 +34,10 @@ public:
     void initialize();
     void tick(float deltaSeconds);
     [[nodiscard]] const Camera::CameraState& cameraState() const;
+    [[nodiscard]] bool shootingModeEnabled() const;
     void setPrimitiveWorld(const std::vector<RenderBackend::PrimitiveInstance>& primitives);
+    void setInteractivePrimitives(const std::vector<RenderBackend::PrimitiveInstance>& primitives);
+    void shootPhysicsSphere(const float origin[3], const float direction[3]);
     void shutdown();
 
     [[nodiscard]] bool isRunning() const;

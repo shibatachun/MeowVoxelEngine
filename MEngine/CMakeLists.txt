@@ -15,9 +15,11 @@ add_library(MEngine STATIC
     src/RenderBackend/Vulkan/VulkanUtils.cpp
     src/Windows/Window.cpp
     src/Physics/PhysicsWorld.cpp
+    src/Physics/TerrainCollision.cpp
     src/Audio/AudioSystem.cpp
     src/InputSystem/InputSystem.cpp
     src/AnimationSystem/AnimationSystem.cpp
+    src/Resources/MeshAsset.cpp
 )
 
 target_include_directories(MEngine
@@ -29,6 +31,12 @@ target_compile_features(MEngine PUBLIC cxx_std_17)
 
 find_program(MENGINE_GLSLC_EXECUTABLE
     NAMES glslc
+    HINTS "$ENV{VULKAN_SDK}/Bin"
+    REQUIRED
+)
+
+find_program(MENGINE_GLSLANG_VALIDATOR_EXECUTABLE
+    NAMES glslangValidator
     HINTS "$ENV{VULKAN_SDK}/Bin"
     REQUIRED
 )
@@ -85,6 +93,78 @@ add_custom_command(
 )
 
 add_custom_command(
+    OUTPUT ${MENGINE_SHADER_BINARY_DIR}/SkyTransmittanceLut.comp.spv
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${MENGINE_SHADER_BINARY_DIR}
+    COMMAND ${MENGINE_GLSLC_EXECUTABLE} -fshader-stage=compute ${MENGINE_SHADER_SOURCE_DIR}/SkyTransmittanceLut.comp.glsl -o ${MENGINE_SHADER_BINARY_DIR}/SkyTransmittanceLut.comp.spv
+    DEPENDS ${MENGINE_SHADER_SOURCE_DIR}/SkyTransmittanceLut.comp.glsl
+    VERBATIM
+)
+
+add_custom_command(
+    OUTPUT ${MENGINE_SHADER_BINARY_DIR}/SkyMultiScatteringLut.comp.spv
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${MENGINE_SHADER_BINARY_DIR}
+    COMMAND ${MENGINE_GLSLC_EXECUTABLE} -fshader-stage=compute ${MENGINE_SHADER_SOURCE_DIR}/SkyMultiScatteringLut.comp.glsl -o ${MENGINE_SHADER_BINARY_DIR}/SkyMultiScatteringLut.comp.spv
+    DEPENDS ${MENGINE_SHADER_SOURCE_DIR}/SkyMultiScatteringLut.comp.glsl
+    VERBATIM
+)
+
+add_custom_command(
+    OUTPUT ${MENGINE_SHADER_BINARY_DIR}/SkyAtmosphere.comp.spv
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${MENGINE_SHADER_BINARY_DIR}
+    COMMAND ${MENGINE_GLSLC_EXECUTABLE} -fshader-stage=compute ${MENGINE_SHADER_SOURCE_DIR}/SkyAtmosphere.comp.glsl -o ${MENGINE_SHADER_BINARY_DIR}/SkyAtmosphere.comp.spv
+    DEPENDS ${MENGINE_SHADER_SOURCE_DIR}/SkyAtmosphere.comp.glsl
+    VERBATIM
+)
+
+add_custom_command(
+    OUTPUT ${MENGINE_SHADER_BINARY_DIR}/CloudDensity.comp.spv
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${MENGINE_SHADER_BINARY_DIR}
+    COMMAND ${MENGINE_GLSLC_EXECUTABLE} -fshader-stage=compute ${MENGINE_SHADER_SOURCE_DIR}/CloudDensity.comp.glsl -o ${MENGINE_SHADER_BINARY_DIR}/CloudDensity.comp.spv
+    DEPENDS ${MENGINE_SHADER_SOURCE_DIR}/CloudDensity.comp.glsl
+    VERBATIM
+)
+
+add_custom_command(
+    OUTPUT ${MENGINE_SHADER_BINARY_DIR}/VolumetricClouds.comp.spv
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${MENGINE_SHADER_BINARY_DIR}
+    COMMAND ${MENGINE_GLSLC_EXECUTABLE} -fshader-stage=compute ${MENGINE_SHADER_SOURCE_DIR}/VolumetricClouds.comp.glsl -o ${MENGINE_SHADER_BINARY_DIR}/VolumetricClouds.comp.spv
+    DEPENDS ${MENGINE_SHADER_SOURCE_DIR}/VolumetricClouds.comp.glsl
+    VERBATIM
+)
+
+add_custom_command(
+    OUTPUT ${MENGINE_SHADER_BINARY_DIR}/WaterOcean.comp.spv
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${MENGINE_SHADER_BINARY_DIR}
+    COMMAND ${MENGINE_GLSLC_EXECUTABLE} -fshader-stage=compute ${MENGINE_SHADER_SOURCE_DIR}/WaterOcean.comp.glsl -o ${MENGINE_SHADER_BINARY_DIR}/WaterOcean.comp.spv
+    DEPENDS ${MENGINE_SHADER_SOURCE_DIR}/WaterOcean.comp.glsl
+    VERBATIM
+)
+
+add_custom_command(
+    OUTPUT ${MENGINE_SHADER_BINARY_DIR}/RayTracingPrototype.rgen.spv
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${MENGINE_SHADER_BINARY_DIR}
+    COMMAND ${MENGINE_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.2 -S rgen ${MENGINE_SHADER_SOURCE_DIR}/RayTracingPrototype.rgen.glsl -o ${MENGINE_SHADER_BINARY_DIR}/RayTracingPrototype.rgen.spv
+    DEPENDS ${MENGINE_SHADER_SOURCE_DIR}/RayTracingPrototype.rgen.glsl
+    VERBATIM
+)
+
+add_custom_command(
+    OUTPUT ${MENGINE_SHADER_BINARY_DIR}/RayTracingPrototype.rmiss.spv
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${MENGINE_SHADER_BINARY_DIR}
+    COMMAND ${MENGINE_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.2 -S rmiss ${MENGINE_SHADER_SOURCE_DIR}/RayTracingPrototype.rmiss.glsl -o ${MENGINE_SHADER_BINARY_DIR}/RayTracingPrototype.rmiss.spv
+    DEPENDS ${MENGINE_SHADER_SOURCE_DIR}/RayTracingPrototype.rmiss.glsl
+    VERBATIM
+)
+
+add_custom_command(
+    OUTPUT ${MENGINE_SHADER_BINARY_DIR}/RayTracingPrototype.rchit.spv
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${MENGINE_SHADER_BINARY_DIR}
+    COMMAND ${MENGINE_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.2 -S rchit ${MENGINE_SHADER_SOURCE_DIR}/RayTracingPrototype.rchit.glsl -o ${MENGINE_SHADER_BINARY_DIR}/RayTracingPrototype.rchit.spv
+    DEPENDS ${MENGINE_SHADER_SOURCE_DIR}/RayTracingPrototype.rchit.glsl
+    VERBATIM
+)
+
+add_custom_command(
     OUTPUT ${MENGINE_SHADER_BINARY_DIR}/ImGui.vert.spv
     COMMAND ${CMAKE_COMMAND} -E make_directory ${MENGINE_SHADER_BINARY_DIR}
     COMMAND ${MENGINE_GLSLC_EXECUTABLE} -fshader-stage=vertex ${MENGINE_SHADER_SOURCE_DIR}/ImGui.vert.glsl -o ${MENGINE_SHADER_BINARY_DIR}/ImGui.vert.spv
@@ -100,6 +180,14 @@ add_custom_command(
     VERBATIM
 )
 
+add_custom_command(
+    OUTPUT ${MENGINE_SHADER_BINARY_DIR}/AntiAliasing.frag.spv
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${MENGINE_SHADER_BINARY_DIR}
+    COMMAND ${MENGINE_GLSLC_EXECUTABLE} -fshader-stage=fragment ${MENGINE_SHADER_SOURCE_DIR}/AntiAliasing.frag.glsl -o ${MENGINE_SHADER_BINARY_DIR}/AntiAliasing.frag.spv
+    DEPENDS ${MENGINE_SHADER_SOURCE_DIR}/AntiAliasing.frag.glsl
+    VERBATIM
+)
+
 add_custom_target(MEngineShaders
     DEPENDS
         ${MENGINE_SHADER_BINARY_DIR}/Primitive.vert.spv
@@ -108,8 +196,18 @@ add_custom_target(MEngineShaders
         ${MENGINE_SHADER_BINARY_DIR}/PBRLighting.frag.spv
         ${MENGINE_SHADER_BINARY_DIR}/SkyAtmosphere.vert.spv
         ${MENGINE_SHADER_BINARY_DIR}/SkyAtmosphere.frag.spv
+        ${MENGINE_SHADER_BINARY_DIR}/SkyTransmittanceLut.comp.spv
+        ${MENGINE_SHADER_BINARY_DIR}/SkyMultiScatteringLut.comp.spv
+        ${MENGINE_SHADER_BINARY_DIR}/SkyAtmosphere.comp.spv
+        ${MENGINE_SHADER_BINARY_DIR}/CloudDensity.comp.spv
+        ${MENGINE_SHADER_BINARY_DIR}/VolumetricClouds.comp.spv
+        ${MENGINE_SHADER_BINARY_DIR}/WaterOcean.comp.spv
+        ${MENGINE_SHADER_BINARY_DIR}/RayTracingPrototype.rgen.spv
+        ${MENGINE_SHADER_BINARY_DIR}/RayTracingPrototype.rmiss.spv
+        ${MENGINE_SHADER_BINARY_DIR}/RayTracingPrototype.rchit.spv
         ${MENGINE_SHADER_BINARY_DIR}/ImGui.vert.spv
         ${MENGINE_SHADER_BINARY_DIR}/ImGui.frag.spv
+        ${MENGINE_SHADER_BINARY_DIR}/AntiAliasing.frag.spv
 )
 
 add_dependencies(MEngine MEngineShaders)
@@ -123,6 +221,7 @@ target_link_libraries(MEngine
         SDL3::SDL3
         ${MEOWENGINE_VULKAN_LOADER_LIBRARY}
     PUBLIC
+        glm::glm
         spdlog::spdlog
 )
 
