@@ -11,6 +11,7 @@
 #include <SDL3/SDL.h>
 #include <glm/vec3.hpp>
 
+#include <cstring>
 #include <utility>
 
 namespace MEngine {
@@ -57,7 +58,7 @@ void Engine::initialize()
     impl_->camera.initialize(static_cast<SDL_Window*>(impl_->config.nativeWindowHandle));
     impl_->physicsWorld.initialize();
     impl_->audioSystem.initialize();
-    impl_->input.initialize();
+    impl_->input.initialize(static_cast<SDL_Window*>(impl_->config.nativeWindowHandle));
     impl_->animator.initialize();
 
     impl_->running = true;
@@ -73,12 +74,19 @@ void Engine::tick(float deltaSeconds)
     impl_->input.poll();
     impl_->camera.update();
     impl_->physicsWorld.step(deltaSeconds);
+    impl_->animator.setTuning(impl_->renderer.animationTuning());
     impl_->animator.update(deltaSeconds);
     impl_->audioSystem.update();
 
     impl_->renderer.beginFrame();
+    impl_->renderer.setMeshSkinningMatrices(impl_->animator.skinningMatrices());
     impl_->renderer.setDynamicPrimitiveInstances(impl_->physicsWorld.dynamicPrimitives());
     impl_->renderer.endFrame(impl_->camera.state());
+}
+
+void Engine::pollInput()
+{
+    impl_->input.poll();
 }
 
 const Camera::CameraState& Engine::cameraState() const
@@ -91,15 +99,93 @@ bool Engine::shootingModeEnabled() const
     return impl_->renderer.shootingModeEnabled();
 }
 
+bool Engine::playerControlModeEnabled() const
+{
+    return impl_->renderer.playerControlModeEnabled();
+}
+
+bool Engine::consumePlayerResetRequested()
+{
+    return impl_->renderer.consumePlayerResetRequested();
+}
+
+bool Engine::consumePlayRequested()
+{
+    return impl_->renderer.consumePlayRequested();
+}
+
+bool Engine::consumeModelLoadRequested(std::string& outPath)
+{
+    return impl_->renderer.consumeModelLoadRequested(outPath);
+}
+
+void Engine::setEditorPlayMode(bool enabled)
+{
+    impl_->renderer.setEditorPlayMode(enabled);
+}
+
+AnimationSystem::AnimationTuning Engine::animationTuning() const
+{
+    return impl_->renderer.animationTuning();
+}
+
+const InputSystem::PlayerInputState& Engine::playerInput() const
+{
+    return impl_->input.playerInput();
+}
+
+void Engine::setCameraState(const Camera::CameraState& state)
+{
+    impl_->camera.setState(state);
+}
+
+void Engine::setPlayerInputEnabled(bool enabled)
+{
+    impl_->input.setPlayerInputEnabled(enabled);
+}
+
+void Engine::setAnimationState(AnimationSystem::AnimationState state)
+{
+    impl_->animator.setAnimationState(state);
+}
+
+void Engine::setCameraExternalControlEnabled(bool enabled)
+{
+    impl_->camera.setExternalControlEnabled(enabled);
+}
+
 void Engine::setPrimitiveWorld(const std::vector<RenderBackend::PrimitiveInstance>& primitives)
 {
-    impl_->physicsWorld.setTerrainColliders(primitives);
+    setPrimitiveCollisionWorld(primitives);
+    setPrimitiveVisualWorld(primitives);
+}
+
+void Engine::setPrimitiveVisualWorld(const std::vector<RenderBackend::PrimitiveInstance>& primitives)
+{
     impl_->renderer.setPrimitiveInstances(primitives);
+}
+
+void Engine::setPrimitiveCollisionWorld(const std::vector<RenderBackend::PrimitiveInstance>& primitives)
+{
+    impl_->physicsWorld.setTerrainColliders(primitives);
 }
 
 void Engine::setInteractivePrimitives(const std::vector<RenderBackend::PrimitiveInstance>& primitives)
 {
     impl_->physicsWorld.setInteractiveColliders(primitives);
+}
+
+void Engine::setMeshAsset(const Resources::MeshAsset& asset)
+{
+    impl_->animator.setMeshAsset(asset);
+    impl_->renderer.setMeshAsset(asset);
+}
+
+void Engine::setMeshWorldTransform(const float transform[16])
+{
+    glm::mat4 matrix(1.0f);
+    std::memcpy(&matrix[0][0], transform, sizeof(float) * 16);
+    impl_->renderer.setMeshWorldTransform(matrix);
 }
 
 void Engine::shootPhysicsSphere(const float origin[3], const float direction[3])

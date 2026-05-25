@@ -152,6 +152,76 @@ float oceanHeight(vec2 position)
     return height;
 }
 
+struct UnderwaterSample
+{
+    vec3 color;
+    vec3 normal;
+    float rawDepth;
+    float smoothDepth;
+};
+
+UnderwaterSample sampleUnderwaterScene(vec2 centerUv, vec4 fallbackPosition, vec3 fallbackColor, vec3 fallbackNormal, float waterLevel, float rayDistance)
+{
+    vec2 texel = 1.0 / max(lighting.cameraParameters.zw, vec2(1.0));
+    float sampleRadius = mix(1.0, 4.0, smoothstep(35.0, 260.0, rayDistance));
+
+    vec3 colorSum = vec3(0.0);
+    vec3 normalSum = vec3(0.0);
+    float depthSum = 0.0;
+    float weightSum = 0.0;
+
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            vec2 sampleUv = clamp(centerUv + vec2(x, y) * texel * sampleRadius, vec2(0.001), vec2(0.999));
+            vec4 samplePosition = texture(sampler2D(g_Position, g_Sampler), sampleUv);
+            if (samplePosition.a < 0.5 || samplePosition.y > waterLevel) {
+                continue;
+            }
+
+            float weight = (x == 0 && y == 0) ? 4.0 : ((x == 0 || y == 0) ? 2.0 : 1.0);
+            colorSum += pow(texture(sampler2D(g_Albedo, g_Sampler), sampleUv).rgb, vec3(2.2)) * weight;
+            normalSum += normalize(texture(sampler2D(g_Normal, g_Sampler), sampleUv).xyz * 2.0 - 1.0) * weight;
+            depthSum += clamp(waterLevel - samplePosition.y, 0.0, 18.0) * weight;
+            weightSum += weight;
+        }
+    }
+
+    UnderwaterSample result;
+    if (weightSum > 0.0) {
+        result.color = colorSum / weightSum;
+        result.normal = normalize(normalSum / weightSum);
+        result.smoothDepth = depthSum / weightSum;
+    } else {
+        result.color = fallbackColor;
+        result.normal = fallbackNormal;
+        result.smoothDepth = clamp(waterLevel - fallbackPosition.y, 0.0, 18.0);
+    }
+
+    result.rawDepth = clamp(waterLevel - fallbackPosition.y, 0.0, 18.0);
+    return result;
+}
+
+float causticPattern(vec2 position, vec2 wind, float time)
+{
+    vec2 p = position * 0.42;
+    vec2 warpP = p * 0.65 + wind * time * 0.12;
+    vec2 warp = vec2(
+        rippleNoise(warpP + vec2(8.1, 2.7)) - rippleNoise(warpP + vec2(1.9, 11.4)),
+        rippleNoise(warpP + vec2(5.3, 17.8)) - rippleNoise(warpP + vec2(14.6, 4.2)));
+    p += warp * 1.35;
+
+    float pattern = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        float fi = float(i);
+        vec2 dir = normalize(rotate(wind, -1.25 + fi * 0.82));
+        float wave = 0.5 + 0.5 * sin(dot(p, dir) * mix(5.5, 9.5, hash11(fi + 2.0)) + time * mix(0.9, 1.8, hash11(fi + 7.0)));
+        pattern += pow(wave, 7.0) * 0.25;
+    }
+
+    float breakup = rippleNoise(p * 1.8 + vec2(time * 0.23, -time * 0.17));
+    return smoothstep(0.52, 0.92, pattern + breakup * 0.18);
+}
+
 void main()
 {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
@@ -193,13 +263,18 @@ void main()
     vec2 refractedUv = clamp(uv + refractionOffset, vec2(0.001), vec2(0.999));
     vec4 refractedPosition = texture(sampler2D(g_Position, g_Sampler), refractedUv);
     vec3 bottomColor = pow(texture(sampler2D(g_Albedo, g_Sampler), refractedUv).rgb, vec3(2.2));
+    vec3 bottomNormal = normalize(texture(sampler2D(g_Normal, g_Sampler), refractedUv).xyz * 2.0 - 1.0);
     if (refractedPosition.a < 0.5 || refractedPosition.y > waterLevel) {
         refractedPosition = packedScenePosition;
         bottomColor = pow(texture(sampler2D(g_Albedo, g_Sampler), uv).rgb, vec3(2.2));
+        bottomNormal = normalize(texture(sampler2D(g_Normal, g_Sampler), uv).xyz * 2.0 - 1.0);
     }
 
-    float waterDepth = clamp(waterLevel - refractedPosition.y, 0.0, 18.0);
-    vec3 bottomNormal = normalize(texture(sampler2D(g_Normal, g_Sampler), refractedUv).xyz * 2.0 - 1.0);
+    UnderwaterSample underwater = sampleUnderwaterScene(refractedUv, refractedPosition, bottomColor, bottomNormal, waterLevel, t);
+    bottomColor = underwater.color;
+    bottomNormal = underwater.normal;
+    float depthSmoothing = smoothstep(18.0, 150.0, t);
+    float waterDepth = mix(underwater.rawDepth, underwater.smoothDepth, depthSmoothing);
     float bottomLight = mix(0.45, 1.0, clamp(dot(bottomNormal, normalize(-lighting.sunDirection.xyz)) * 0.5 + 0.5, 0.0, 1.0));
     vec3 absorption = exp(-vec3(0.16, 0.045, 0.022) * waterDepth);
 
@@ -218,15 +293,17 @@ void main()
     float tightSparkle = pow(max(dot(normal, halfway), 0.0), 620.0) * (0.35 + length(normal.xz) * 1.7);
     float sunSpec = pow(max(dot(reflected, sunDirection), 0.0), mix(520.0, 120.0, lighting.waterParameters.y));
     float broadGlint = pow(max(dot(reflected, sunDirection), 0.0), 18.0) * 0.16;
-    float caustic = pow(0.5 + 0.5 * sin(hit.x * 2.7 + hit.z * 1.9 + lighting.waterWindParameters.w * 4.0), 5.0);
-    caustic *= smoothstep(0.0, 2.5, waterDepth) * (1.0 - smoothstep(5.0, 14.0, waterDepth));
-    float shoreline = 1.0 - smoothstep(0.0, 0.9, waterDepth);
+    vec2 wind = normalize(lighting.waterWindParameters.xy + vec2(0.0001, 0.0));
+    float caustic = causticPattern(refractedPosition.xz + normal.xz * 2.0, wind, lighting.waterWindParameters.w);
+    caustic *= smoothstep(0.15, 2.0, waterDepth) * (1.0 - smoothstep(4.0, 11.0, waterDepth));
+    caustic *= (1.0 - smoothstep(35.0, 140.0, t)) * nDotL;
+    float shoreline = (1.0 - smoothstep(0.0, 0.9, underwater.rawDepth)) * (1.0 - smoothstep(30.0, 120.0, t));
     float foam = max(smoothstep(0.18, 0.42, length(normal.xz)) * (1.0 - distanceFade * 0.75), shoreline * 0.32);
 
     vec3 sunColor = lighting.sunColorAndIntensity.rgb * lighting.sunColorAndIntensity.a;
     vec3 color = mix(refractedColor, reflection, fresnel * 0.88);
     color += waterTint * nDotL * 0.18;
-    color += vec3(0.35, 0.85, 0.95) * caustic * 0.18;
+    color += vec3(0.35, 0.85, 0.95) * caustic * 0.045;
     color += sunColor * (sunSpec * 3.5 + broadGlint + tightSparkle * 1.2);
     color = mix(color, vec3(0.90, 0.98, 1.0), foam * 0.28);
     color = mix(color, skyColor, smoothstep(420.0, 900.0, t) * 0.55);

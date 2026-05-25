@@ -17,7 +17,11 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <functional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -30,8 +34,8 @@ namespace MEngine::RenderBackend::Vulkan {
 
 namespace {
 
-constexpr uint32_t MaxPrimitiveVertices = 2097152;
-constexpr uint32_t MaxPrimitiveIndices = 4194304;
+constexpr uint32_t MaxPrimitiveVertices = 6291456;
+constexpr uint32_t MaxPrimitiveIndices = 12582912;
 constexpr uint32_t MaxDynamicPrimitiveVertices = 65536;
 constexpr uint32_t MaxDynamicPrimitiveIndices = 131072;
 constexpr uint32_t SkyTransmittanceLutWidth = 256;
@@ -41,6 +45,7 @@ constexpr uint32_t SkyMultiScatteringLutHeight = 32;
 constexpr uint32_t CloudDensityTextureWidth = 128;
 constexpr uint32_t CloudDensityTextureHeight = 64;
 constexpr uint32_t CloudDensityTextureDepth = 128;
+constexpr uint32_t CharacterShadowMapSize = 2048;
 using Vertex = Resources::MeshVertex;
 
 uint32_t divideAndRoundUp(uint32_t value, uint32_t divisor)
@@ -238,7 +243,13 @@ uint64_t VulkanRenderer::render(uint32_t imageIndex)
 
     {
         RenderAccessGraph::Pass& pass = graph.addPass("Mesh Upload");
+        pass.textures = {
+            { whiteTexture_, nvrhi::ResourceStates::CopyDest },
+            { modelBaseColorTexture_, nvrhi::ResourceStates::CopyDest },
+        };
         pass.execute = [this]() {
+            uploadGeometryTextures();
+
             if (meshDirty_) {
                 rebuildMesh();
                 meshDirty_ = false;
@@ -248,8 +259,13 @@ uint64_t VulkanRenderer::render(uint32_t imageIndex)
             if (gpuMeshDirty_ && !vertices_.empty() && !indices_.empty()) {
                 commandList_->writeBuffer(vertexBuffer_, vertices_.data(), vertices_.size() * sizeof(Vertex));
                 commandList_->writeBuffer(indexBuffer_, indices_.data(), indices_.size() * sizeof(uint32_t));
+                if (hasMeshAsset_ && !meshAsset_.vertices.empty()) {
+                    commandList_->writeBuffer(meshSourceVertexBuffer_, meshAsset_.vertices.data(), meshAsset_.vertices.size() * sizeof(Vertex));
+                }
                 uploadedIndexCount_ = static_cast<uint32_t>(indices_.size());
+                uploadedMeshAssetIndexCount_ = meshAssetIndexCount_;
                 gpuMeshDirty_ = false;
+                skinningMatricesDirty_ = true;
                 rayTracingAccelerationStructuresDirty_ = true;
             }
 
@@ -273,12 +289,66 @@ uint64_t VulkanRenderer::render(uint32_t imageIndex)
     }
 
     {
+        RenderAccessGraph::Pass& pass = graph.addPass("Skinning Compute");
+        pass.buffers = {
+            { meshSourceVertexBuffer_, nvrhi::ResourceStates::ShaderResource },
+            { skinningMatricesBuffer_, nvrhi::ResourceStates::ShaderResource },
+            { skinningConstantsBuffer_, nvrhi::ResourceStates::ConstantBuffer },
+            { vertexBuffer_, nvrhi::ResourceStates::UnorderedAccess },
+        };
+        pass.bindingSets = {
+            skinMeshBindingSet_,
+        };
+        pass.execute = [this]() { dispatchSkinningCompute(); };
+    }
+
+    {
+        RenderAccessGraph::Pass& pass = graph.addPass("Character Shadow Map");
+        pass.textures = {
+            { shadowDepthTexture_, nvrhi::ResourceStates::DepthWrite },
+        };
+        pass.buffers = {
+            { vertexBuffer_, nvrhi::ResourceStates::VertexBuffer },
+            { indexBuffer_, nvrhi::ResourceStates::IndexBuffer },
+        };
+        pass.execute = [this]() {
+            if (uploadedMeshAssetIndexCount_ == 0) {
+                commandList_->clearDepthStencilTexture(shadowDepthTexture_, nvrhi::AllSubresources, true, 1.0f, false, 0);
+                return;
+            }
+
+            commandList_->clearDepthStencilTexture(shadowDepthTexture_, nvrhi::AllSubresources, true, 1.0f, false, 0);
+
+            nvrhi::ViewportState viewportState;
+            viewportState.addViewportAndScissorRect(nvrhi::Viewport(
+                static_cast<float>(CharacterShadowMapSize),
+                static_cast<float>(CharacterShadowMapSize)));
+
+            nvrhi::GraphicsState graphicsState;
+            graphicsState.setPipeline(shadowDepthPipeline_);
+            graphicsState.setFramebuffer(shadowFramebuffer_);
+            graphicsState.setViewport(viewportState);
+            graphicsState.addVertexBuffer(nvrhi::VertexBufferBinding().setBuffer(vertexBuffer_).setSlot(0).setOffset(0));
+            graphicsState.setIndexBuffer(nvrhi::IndexBufferBinding().setBuffer(indexBuffer_).setFormat(nvrhi::Format::R32_UINT).setOffset(0));
+
+            const PushConstants shadowPushConstants = buildShadowPushConstants();
+            commandList_->setGraphicsState(graphicsState);
+            commandList_->setPushConstants(&shadowPushConstants, sizeof(shadowPushConstants));
+            commandList_->drawIndexed(nvrhi::DrawArguments().setVertexCount(uploadedMeshAssetIndexCount_));
+        };
+    }
+
+    {
         RenderAccessGraph::Pass& pass = graph.addPass("Geometry");
         pass.buffers = {
             { vertexBuffer_, nvrhi::ResourceStates::VertexBuffer },
             { indexBuffer_, nvrhi::ResourceStates::IndexBuffer },
             { dynamicVertexBuffer_, nvrhi::ResourceStates::VertexBuffer },
             { dynamicIndexBuffer_, nvrhi::ResourceStates::IndexBuffer },
+        };
+        pass.bindingSets = {
+            geometryWhiteBindingSet_,
+            geometryModelBindingSet_,
         };
         pass.execute = [this]() {
             if (uploadedIndexCount_ == 0 && uploadedDynamicIndexCount_ == 0) {
@@ -291,22 +361,42 @@ uint64_t VulkanRenderer::render(uint32_t imageIndex)
                 static_cast<float>(swapchain_->extent().height)));
 
             const PushConstants pushConstants = buildPushConstants();
-            if (uploadedIndexCount_ > 0) {
+            const uint32_t modelIndexCount = (std::min)(uploadedMeshAssetIndexCount_, uploadedIndexCount_);
+            if (modelIndexCount > 0) {
                 nvrhi::GraphicsState graphicsState;
                 graphicsState.setPipeline(geometryPipeline_);
                 graphicsState.setFramebuffer(gBufferFramebuffer_);
                 graphicsState.setViewport(viewportState);
+                graphicsState.addBindingSet(geometryModelBindingSet_);
+                graphicsState.addVertexBuffer(nvrhi::VertexBufferBinding().setBuffer(vertexBuffer_).setSlot(0).setOffset(0));
+                graphicsState.setIndexBuffer(nvrhi::IndexBufferBinding().setBuffer(indexBuffer_).setFormat(nvrhi::Format::R32_UINT).setOffset(0));
+                PushConstants modelPushConstants = pushConstants;
+                modelPushConstants.materialParameters[3] = 1.0f;
+                commandList_->setGraphicsState(graphicsState);
+                commandList_->setPushConstants(&modelPushConstants, sizeof(modelPushConstants));
+                commandList_->drawIndexed(nvrhi::DrawArguments().setVertexCount(modelIndexCount));
+            }
+            const uint32_t terrainIndexCount = uploadedIndexCount_ - modelIndexCount;
+            if (terrainIndexCount > 0) {
+                nvrhi::GraphicsState graphicsState;
+                graphicsState.setPipeline(geometryPipeline_);
+                graphicsState.setFramebuffer(gBufferFramebuffer_);
+                graphicsState.setViewport(viewportState);
+                graphicsState.addBindingSet(geometryWhiteBindingSet_);
                 graphicsState.addVertexBuffer(nvrhi::VertexBufferBinding().setBuffer(vertexBuffer_).setSlot(0).setOffset(0));
                 graphicsState.setIndexBuffer(nvrhi::IndexBufferBinding().setBuffer(indexBuffer_).setFormat(nvrhi::Format::R32_UINT).setOffset(0));
                 commandList_->setGraphicsState(graphicsState);
                 commandList_->setPushConstants(&pushConstants, sizeof(pushConstants));
-                commandList_->drawIndexed(nvrhi::DrawArguments().setVertexCount(uploadedIndexCount_));
+                commandList_->drawIndexed(nvrhi::DrawArguments()
+                    .setVertexCount(terrainIndexCount)
+                    .setStartIndexLocation(modelIndexCount));
             }
             if (uploadedDynamicIndexCount_ > 0) {
                 nvrhi::GraphicsState graphicsState;
                 graphicsState.setPipeline(geometryPipeline_);
                 graphicsState.setFramebuffer(gBufferFramebuffer_);
                 graphicsState.setViewport(viewportState);
+                graphicsState.addBindingSet(geometryWhiteBindingSet_);
                 graphicsState.addVertexBuffer(nvrhi::VertexBufferBinding().setBuffer(dynamicVertexBuffer_).setSlot(0).setOffset(0));
                 graphicsState.setIndexBuffer(nvrhi::IndexBufferBinding().setBuffer(dynamicIndexBuffer_).setFormat(nvrhi::Format::R32_UINT).setOffset(0));
                 commandList_->setGraphicsState(graphicsState);
@@ -382,6 +472,7 @@ uint64_t VulkanRenderer::render(uint32_t imageIndex)
             { sampledGBufferNormal(), nvrhi::ResourceStates::ShaderResource },
             { sampledGBufferAlbedo(), nvrhi::ResourceStates::ShaderResource },
             { sampledGBufferMaterial(), nvrhi::ResourceStates::ShaderResource },
+            { shadowDepthTexture_, nvrhi::ResourceStates::ShaderResource },
             { postColorTexture_, nvrhi::ResourceStates::RenderTarget },
         };
         pass.bindingSets = { pbrLightingBindingSet_ };
@@ -413,10 +504,27 @@ uint64_t VulkanRenderer::render(uint32_t imageIndex)
             commandList_->setGraphicsState(antiAliasingState);
             const float shaderMode = antiAliasingMode_ == AntiAliasingMode::FXAA ? 1.0f :
                 (antiAliasingMode_ == AntiAliasingMode::TAA ? 2.0f : 0.0f);
+
+            const float width = (std::max)(static_cast<float>(swapchain_->extent().width), 1.0f);
+            const float height = (std::max)(static_cast<float>(swapchain_->extent().height), 1.0f);
+            const float aspect = width / height;
+            const float tanHalfFov = std::tan(glm::radians(camera_.fovDegrees) * 0.5f);
+            const glm::vec3 cameraPosition { camera_.position[0], camera_.position[1], camera_.position[2] };
+            const glm::vec3 cameraTarget { camera_.target[0], camera_.target[1], camera_.target[2] };
+            const glm::vec3 forward = glm::normalize(cameraTarget - cameraPosition);
+            const glm::vec3 right = glm::normalize(glm::cross(forward, glm::vec3(0.0f, 1.0f, 0.0f)));
+            const glm::vec3 up = glm::cross(right, forward);
+            const glm::vec3 sunDirection = glm::normalize(-glm::vec3(sunDirection_[0], sunDirection_[1], sunDirection_[2]));
+            const float sunForward = glm::dot(sunDirection, forward);
+            const float sunProjectionDepth = std::abs(sunForward) > 0.001f ? sunForward : (sunForward < 0.0f ? -0.001f : 0.001f);
+            const float sunScreenX = glm::dot(sunDirection, right) / (sunProjectionDepth * tanHalfFov * aspect);
+            const float sunScreenY = glm::dot(sunDirection, up) / (sunProjectionDepth * tanHalfFov);
+            const float sunVisible = sunForward > 0.02f ? std::clamp((sunForward - 0.02f) * 8.0f, 0.0f, 1.0f) : 0.0f;
+
             const AntiAliasingConstants constants {
                 {
-                    1.0f / (std::max)(static_cast<float>(swapchain_->extent().width), 1.0f),
-                    1.0f / (std::max)(static_cast<float>(swapchain_->extent().height), 1.0f),
+                    1.0f / width,
+                    1.0f / height,
                     shaderMode,
                     taaHistoryValid_ ? 1.0f : 0.0f,
                 },
@@ -424,6 +532,18 @@ uint64_t VulkanRenderer::render(uint32_t imageIndex)
                     taaHistoryWeight_,
                     0.0f,
                     0.0f,
+                    0.0f,
+                },
+                {
+                    sunScreenX * 0.5f + 0.5f,
+                    sunScreenY * 0.5f + 0.5f,
+                    sunVisible,
+                    std::clamp(sunIntensity_ * 0.32f, 0.0f, 2.4f),
+                },
+                {
+                    sunColor_[0],
+                    sunColor_[1],
+                    sunColor_[2],
                     0.0f,
                 },
             };
@@ -445,6 +565,7 @@ uint64_t VulkanRenderer::render(uint32_t imageIndex)
     }
 
     graph.addPass("ImGui").execute = [this, framebuffer]() {
+        imguiLayer_->setStatsVisible(!editorPlayMode_);
         imguiLayer_->render(commandList_, framebuffer, swapchain_->extent().width, swapchain_->extent().height);
     };
 
@@ -478,11 +599,16 @@ void VulkanRenderer::releaseGpuResources()
     indices_.clear();
     dynamicVertices_.clear();
     dynamicIndices_.clear();
+    meshRenderVertices_.clear();
+    meshSkinningMatrices_.clear();
     framebuffers_.clear();
     imguiLayer_.reset();
     rayTracingCompositeBindingSet_ = nullptr;
     rayTracingBindingSet_ = nullptr;
     antiAliasingBindingSet_ = nullptr;
+    skinMeshBindingSet_ = nullptr;
+    geometryModelBindingSet_ = nullptr;
+    geometryWhiteBindingSet_ = nullptr;
     waterOceanBindingSet_ = nullptr;
     volumetricCloudsBindingSet_ = nullptr;
     cloudDensityBindingSet_ = nullptr;
@@ -491,7 +617,9 @@ void VulkanRenderer::releaseGpuResources()
     skyTransmittanceBindingSet_ = nullptr;
     skyAtmosphereBindingSet_ = nullptr;
     pbrLightingBindingSet_ = nullptr;
+    shadowDepthBindingLayout_ = nullptr;
     rayTracingBindingLayout_ = nullptr;
+    skinMeshBindingLayout_ = nullptr;
     antiAliasingBindingLayout_ = nullptr;
     waterOceanBindingLayout_ = nullptr;
     volumetricCloudsBindingLayout_ = nullptr;
@@ -503,7 +631,10 @@ void VulkanRenderer::releaseGpuResources()
     pbrLightingBindingLayout_ = nullptr;
     geometryBindingLayout_ = nullptr;
     cloudSampler_ = nullptr;
+    geometrySampler_ = nullptr;
     lightingSampler_ = nullptr;
+    modelBaseColorTexture_ = nullptr;
+    whiteTexture_ = nullptr;
     rayTracingOutputTexture_ = nullptr;
     taaHistoryTexture_ = nullptr;
     postColorTexture_ = nullptr;
@@ -514,6 +645,7 @@ void VulkanRenderer::releaseGpuResources()
     skyMultiScatteringLut_ = nullptr;
     skyTransmittanceLut_ = nullptr;
     postFramebuffer_ = nullptr;
+    shadowFramebuffer_ = nullptr;
     gBufferFramebuffer_ = nullptr;
     resolvedGBufferMaterial_ = nullptr;
     resolvedGBufferAlbedo_ = nullptr;
@@ -523,8 +655,12 @@ void VulkanRenderer::releaseGpuResources()
     gBufferAlbedo_ = nullptr;
     gBufferNormal_ = nullptr;
     gBufferPosition_ = nullptr;
+    shadowDepthTexture_ = nullptr;
     depthTexture_ = nullptr;
     lightingConstantsBuffer_ = nullptr;
+    skinningMatricesBuffer_ = nullptr;
+    skinningConstantsBuffer_ = nullptr;
+    meshSourceVertexBuffer_ = nullptr;
     dynamicIndexBuffer_ = nullptr;
     dynamicVertexBuffer_ = nullptr;
     indexBuffer_ = nullptr;
@@ -532,6 +668,7 @@ void VulkanRenderer::releaseGpuResources()
     commandList_ = nullptr;
     rayTracingShaderTable_ = nullptr;
     rayTracingPipeline_ = nullptr;
+    skinMeshPipeline_ = nullptr;
     rayTracingTlas_ = nullptr;
     rayTracingBlas_ = nullptr;
     waterOceanPipeline_ = nullptr;
@@ -543,11 +680,14 @@ void VulkanRenderer::releaseGpuResources()
     skyAtmospherePipeline_ = nullptr;
     antiAliasingPipeline_ = nullptr;
     pbrLightingPipeline_ = nullptr;
+    shadowDepthPipeline_ = nullptr;
     geometryPipeline_ = nullptr;
+    shadowInputLayout_ = nullptr;
     inputLayout_ = nullptr;
     rayTracingMissShader_ = nullptr;
     rayTracingClosestHitShader_ = nullptr;
     rayTracingRayGenShader_ = nullptr;
+    skinMeshComputeShader_ = nullptr;
     waterOceanComputeShader_ = nullptr;
     volumetricCloudsComputeShader_ = nullptr;
     cloudDensityComputeShader_ = nullptr;
@@ -559,6 +699,8 @@ void VulkanRenderer::releaseGpuResources()
     antiAliasingFragmentShader_ = nullptr;
     pbrLightingFragmentShader_ = nullptr;
     pbrLightingVertexShader_ = nullptr;
+    shadowDepthFragmentShader_ = nullptr;
+    shadowDepthVertexShader_ = nullptr;
     geometryFragmentShader_ = nullptr;
     geometryVertexShader_ = nullptr;
     meshDirty_ = true;
@@ -567,7 +709,14 @@ void VulkanRenderer::releaseGpuResources()
     dynamicGpuMeshDirty_ = true;
     rayTracingAccelerationStructuresDirty_ = true;
     uploadedIndexCount_ = 0;
+    uploadedMeshAssetIndexCount_ = 0;
+    meshAssetIndexCount_ = 0;
+    meshAssetVertexCount_ = 0;
     uploadedDynamicIndexCount_ = 0;
+    whiteTextureDirty_ = true;
+    modelBaseColorTextureDirty_ = !modelBaseColorPixels_.empty();
+    skinningMatricesDirty_ = false;
+    skinningBindingSetDirty_ = true;
 }
 
 void VulkanRenderer::addPrimitive(BasicPrimitiveType type)
@@ -627,9 +776,126 @@ void VulkanRenderer::setDynamicPrimitiveInstances(const std::vector<PrimitiveIns
     dynamicGpuMeshDirty_ = true;
 }
 
+void VulkanRenderer::setMeshAsset(const Resources::MeshAsset& asset)
+{
+    meshAsset_ = asset;
+    hasMeshAsset_ = !meshAsset_.vertices.empty() && !meshAsset_.indices.empty();
+    meshRenderVertices_.clear();
+    meshSkinningMatrices_.clear();
+    computeMeshFitTransform();
+    modelBaseColorPixels_.clear();
+    modelBaseColorWidth_ = 1;
+    modelBaseColorHeight_ = 1;
+
+    std::string requestedTexture;
+    if (!meshAsset_.materials.empty()) {
+        requestedTexture = meshAsset_.materials.front().baseColorTexture;
+    }
+    auto fileName = [](const std::string& path) {
+        const size_t slash = path.find_last_of("/\\");
+        return slash == std::string::npos ? path : path.substr(slash + 1);
+    };
+
+    const Resources::MeshEmbeddedTexture* selectedTexture = nullptr;
+    for (const Resources::MeshEmbeddedTexture& texture : meshAsset_.embeddedTextures) {
+        if (texture.rgba.empty() || texture.width == 0 || texture.height == 0) {
+            continue;
+        }
+        if (selectedTexture == nullptr ||
+            texture.name == requestedTexture ||
+            fileName(texture.name) == fileName(requestedTexture)) {
+            selectedTexture = &texture;
+            if (texture.name == requestedTexture || fileName(texture.name) == fileName(requestedTexture)) {
+                break;
+            }
+        }
+    }
+
+    if (selectedTexture) {
+        modelBaseColorPixels_ = selectedTexture->rgba;
+        modelBaseColorWidth_ = selectedTexture->width;
+        modelBaseColorHeight_ = selectedTexture->height;
+        modelBaseColorTextureDirty_ = true;
+
+        if (device_ && device_->nvrhiDevice()) {
+            modelBaseColorTexture_ = device_->nvrhiDevice()->createTexture(nvrhi::TextureDesc()
+                .setDimension(nvrhi::TextureDimension::Texture2D)
+                .setWidth(modelBaseColorWidth_)
+                .setHeight(modelBaseColorHeight_)
+                .setFormat(nvrhi::Format::RGBA8_UNORM)
+                .setDebugName("ModelBaseColorTexture")
+                .enableAutomaticStateTracking(nvrhi::ResourceStates::ShaderResource));
+            createGeometryBindingSets();
+        }
+    } else {
+        modelBaseColorTexture_ = nullptr;
+        modelBaseColorTextureDirty_ = false;
+        if (device_ && device_->nvrhiDevice()) {
+            createGeometryBindingSets();
+        }
+    }
+
+    meshDirty_ = true;
+    gpuMeshDirty_ = true;
+    rayTracingAccelerationStructuresDirty_ = true;
+}
+
+void VulkanRenderer::setMeshSkinningMatrices(const std::vector<glm::mat4>& matrices)
+{
+    const size_t matrixCount = (std::min)(matrices.size(), static_cast<size_t>(128));
+    meshSkinningMatrices_.assign(matrices.begin(), matrices.begin() + matrixCount);
+    skinningMatricesDirty_ = !meshSkinningMatrices_.empty();
+}
+
+void VulkanRenderer::setMeshWorldTransform(const glm::mat4& transform)
+{
+    meshWorldTransform_ = transform;
+    skinningMatricesDirty_ = !meshSkinningMatrices_.empty();
+}
+
+bool VulkanRenderer::playerControlModeEnabled() const
+{
+    return playerControlModeEnabled_;
+}
+
 bool VulkanRenderer::shootingModeEnabled() const
 {
     return shootingModeEnabled_;
+}
+
+AnimationSystem::AnimationTuning VulkanRenderer::animationTuning() const
+{
+    return animationTuning_;
+}
+
+bool VulkanRenderer::consumePlayerResetRequested()
+{
+    const bool requested = playerResetRequested_;
+    playerResetRequested_ = false;
+    return requested;
+}
+
+bool VulkanRenderer::consumePlayRequested()
+{
+    const bool requested = playRequested_;
+    playRequested_ = false;
+    return requested;
+}
+
+bool VulkanRenderer::consumeModelLoadRequested(std::string& outPath)
+{
+    if (pendingModelLoadPath_.empty()) {
+        return false;
+    }
+    outPath = pendingModelLoadPath_;
+    pendingModelLoadPath_.clear();
+    return true;
+}
+
+void VulkanRenderer::setEditorPlayMode(bool enabled)
+{
+    editorPlayMode_ = enabled;
+    playerControlModeEnabled_ = enabled;
 }
 
 void VulkanRenderer::createFramebuffers(VulkanSwapchain& swapchain)
@@ -637,6 +903,7 @@ void VulkanRenderer::createFramebuffers(VulkanSwapchain& swapchain)
     createGBufferTextures(swapchain);
     createPostProcessTextures(swapchain);
     createDepthTexture(swapchain);
+    createShadowResources();
     createAtmosphereTextures(swapchain);
 
     nvrhi::FramebufferDesc gBufferDesc;
@@ -648,6 +915,13 @@ void VulkanRenderer::createFramebuffers(VulkanSwapchain& swapchain)
     gBufferFramebuffer_ = device_->nvrhiDevice()->createFramebuffer(gBufferDesc);
     if (!gBufferFramebuffer_) {
         throw std::runtime_error("Failed to create Vulkan renderer G-buffer framebuffer");
+    }
+
+    nvrhi::FramebufferDesc shadowDesc;
+    shadowDesc.setDepthAttachment(shadowDepthTexture_);
+    shadowFramebuffer_ = device_->nvrhiDevice()->createFramebuffer(shadowDesc);
+    if (!shadowFramebuffer_) {
+        throw std::runtime_error("Failed to create Vulkan renderer character shadow framebuffer");
     }
 
     nvrhi::FramebufferDesc postDesc;
@@ -776,11 +1050,29 @@ void VulkanRenderer::createDepthTexture(VulkanSwapchain& swapchain)
     }
 }
 
+void VulkanRenderer::createShadowResources()
+{
+    shadowDepthTexture_ = device_->nvrhiDevice()->createTexture(nvrhi::TextureDesc()
+        .setDimension(nvrhi::TextureDimension::Texture2D)
+        .setWidth(CharacterShadowMapSize)
+        .setHeight(CharacterShadowMapSize)
+        .setFormat(nvrhi::Format::D32)
+        .setIsRenderTarget(true)
+        .setDebugName("CharacterShadowDepth")
+        .enableAutomaticStateTracking(nvrhi::ResourceStates::ShaderResource));
+
+    if (!shadowDepthTexture_) {
+        throw std::runtime_error("Failed to create Vulkan renderer character shadow texture");
+    }
+}
+
 void VulkanRenderer::createShaders()
 {
     const std::string shaderDir = MENGINE_SHADER_BINARY_DIR;
     const std::vector<uint8_t> geometryVertexSpirV = VulkanShader::readSpirV(shaderDir + "/Primitive.vert.spv");
     const std::vector<uint8_t> geometryFragmentSpirV = VulkanShader::readSpirV(shaderDir + "/Primitive.frag.spv");
+    const std::vector<uint8_t> shadowDepthVertexSpirV = VulkanShader::readSpirV(shaderDir + "/ShadowDepth.vert.spv");
+    const std::vector<uint8_t> shadowDepthFragmentSpirV = VulkanShader::readSpirV(shaderDir + "/ShadowDepth.frag.spv");
     const std::vector<uint8_t> pbrLightingVertexSpirV = VulkanShader::readSpirV(shaderDir + "/PBRLighting.vert.spv");
     const std::vector<uint8_t> pbrLightingFragmentSpirV = VulkanShader::readSpirV(shaderDir + "/PBRLighting.frag.spv");
     const std::vector<uint8_t> antiAliasingFragmentSpirV = VulkanShader::readSpirV(shaderDir + "/AntiAliasing.frag.spv");
@@ -792,6 +1084,7 @@ void VulkanRenderer::createShaders()
     const std::vector<uint8_t> cloudDensityComputeSpirV = VulkanShader::readSpirV(shaderDir + "/CloudDensity.comp.spv");
     const std::vector<uint8_t> volumetricCloudsComputeSpirV = VulkanShader::readSpirV(shaderDir + "/VolumetricClouds.comp.spv");
     const std::vector<uint8_t> waterOceanComputeSpirV = VulkanShader::readSpirV(shaderDir + "/WaterOcean.comp.spv");
+    const std::vector<uint8_t> skinMeshComputeSpirV = VulkanShader::readSpirV(shaderDir + "/SkinMesh.comp.spv");
     std::vector<uint8_t> rayTracingRayGenSpirV;
     std::vector<uint8_t> rayTracingMissSpirV;
     std::vector<uint8_t> rayTracingClosestHitSpirV;
@@ -816,6 +1109,22 @@ void VulkanRenderer::createShaders()
             .setEntryName("main"),
         geometryFragmentSpirV.data(),
         geometryFragmentSpirV.size());
+
+    shadowDepthVertexShader_ = device_->nvrhiDevice()->createShader(
+        nvrhi::ShaderDesc()
+            .setShaderType(nvrhi::ShaderType::Vertex)
+            .setDebugName("CharacterShadowDepthVS")
+            .setEntryName("main"),
+        shadowDepthVertexSpirV.data(),
+        shadowDepthVertexSpirV.size());
+
+    shadowDepthFragmentShader_ = device_->nvrhiDevice()->createShader(
+        nvrhi::ShaderDesc()
+            .setShaderType(nvrhi::ShaderType::Pixel)
+            .setDebugName("CharacterShadowDepthPS")
+            .setEntryName("main"),
+        shadowDepthFragmentSpirV.data(),
+        shadowDepthFragmentSpirV.size());
 
     pbrLightingVertexShader_ = device_->nvrhiDevice()->createShader(
         nvrhi::ShaderDesc()
@@ -904,6 +1213,14 @@ void VulkanRenderer::createShaders()
             .setEntryName("main"),
         waterOceanComputeSpirV.data(),
         waterOceanComputeSpirV.size());
+
+    skinMeshComputeShader_ = device_->nvrhiDevice()->createShader(
+        nvrhi::ShaderDesc()
+            .setShaderType(nvrhi::ShaderType::Compute)
+            .setDebugName("SkinMeshCS")
+            .setEntryName("main"),
+        skinMeshComputeSpirV.data(),
+        skinMeshComputeSpirV.size());
     if (rayTracingEnabled_) {
         rayTracingRayGenShader_ = device_->nvrhiDevice()->createShader(
             nvrhi::ShaderDesc()
@@ -930,12 +1247,13 @@ void VulkanRenderer::createShaders()
             rayTracingClosestHitSpirV.size());
     }
 
-    if (!geometryVertexShader_ || !geometryFragmentShader_ || !pbrLightingVertexShader_ ||
+    if (!geometryVertexShader_ || !geometryFragmentShader_ || !shadowDepthVertexShader_ ||
+        !shadowDepthFragmentShader_ || !pbrLightingVertexShader_ ||
         !pbrLightingFragmentShader_ || !antiAliasingFragmentShader_ ||
         !skyAtmosphereVertexShader_ || !skyAtmosphereFragmentShader_ ||
         !skyTransmittanceComputeShader_ || !skyMultiScatteringComputeShader_ ||
         !skyAtmosphereComputeShader_ || !cloudDensityComputeShader_ || !volumetricCloudsComputeShader_ ||
-        !waterOceanComputeShader_ ||
+        !waterOceanComputeShader_ || !skinMeshComputeShader_ ||
         (rayTracingEnabled_ && (!rayTracingRayGenShader_ || !rayTracingMissShader_ || !rayTracingClosestHitShader_))) {
         throw std::runtime_error("Failed to create NVRHI shaders for Vulkan renderer");
     }
@@ -947,8 +1265,16 @@ void VulkanRenderer::createShaders()
         nvrhi::VertexAttributeDesc().setName("TEXCOORD").setFormat(nvrhi::Format::RG32_FLOAT).setOffset(offsetof(Vertex, texCoord)).setElementStride(sizeof(Vertex)),
     };
     inputLayout_ = device_->nvrhiDevice()->createInputLayout(inputElements, 4, geometryVertexShader_);
+    shadowInputLayout_ = device_->nvrhiDevice()->createInputLayout(inputElements, 1, shadowDepthVertexShader_);
 
     geometryBindingLayout_ = device_->nvrhiDevice()->createBindingLayout(nvrhi::BindingLayoutDesc()
+        .setVisibility(nvrhi::ShaderType::AllGraphics)
+        .setBindingOffsets(nvrhi::VulkanBindingOffsets().setShaderResourceOffset(0).setSamplerOffset(0))
+        .addItem(nvrhi::BindingLayoutItem::PushConstants(0, sizeof(PushConstants)))
+        .addItem(nvrhi::BindingLayoutItem::Texture_SRV(1))
+        .addItem(nvrhi::BindingLayoutItem::Sampler(2)));
+
+    shadowDepthBindingLayout_ = device_->nvrhiDevice()->createBindingLayout(nvrhi::BindingLayoutDesc()
         .setVisibility(nvrhi::ShaderType::AllGraphics)
         .addItem(nvrhi::BindingLayoutItem::PushConstants(0, sizeof(PushConstants))));
 
@@ -960,7 +1286,8 @@ void VulkanRenderer::createShaders()
         .addItem(nvrhi::BindingLayoutItem::Texture_SRV(2))
         .addItem(nvrhi::BindingLayoutItem::Texture_SRV(3))
         .addItem(nvrhi::BindingLayoutItem::Sampler(4))
-        .addItem(nvrhi::BindingLayoutItem::ConstantBuffer(5)));
+        .addItem(nvrhi::BindingLayoutItem::ConstantBuffer(5))
+        .addItem(nvrhi::BindingLayoutItem::Texture_SRV(6)));
 
     antiAliasingBindingLayout_ = device_->nvrhiDevice()->createBindingLayout(nvrhi::BindingLayoutDesc()
         .setVisibility(nvrhi::ShaderType::AllGraphics)
@@ -1032,6 +1359,14 @@ void VulkanRenderer::createShaders()
         .addItem(nvrhi::BindingLayoutItem::Sampler(6))
         .addItem(nvrhi::BindingLayoutItem::Texture_UAV(7)));
 
+    skinMeshBindingLayout_ = device_->nvrhiDevice()->createBindingLayout(nvrhi::BindingLayoutDesc()
+        .setVisibility(nvrhi::ShaderType::Compute)
+        .setBindingOffsets(computeOffsets)
+        .addItem(nvrhi::BindingLayoutItem::ConstantBuffer(0))
+        .addItem(nvrhi::BindingLayoutItem::RawBuffer_SRV(1))
+        .addItem(nvrhi::BindingLayoutItem::RawBuffer_SRV(2))
+        .addItem(nvrhi::BindingLayoutItem::RawBuffer_UAV(3)));
+
     if (rayTracingEnabled_) {
         rayTracingBindingLayout_ = device_->nvrhiDevice()->createBindingLayout(nvrhi::BindingLayoutDesc()
             .setVisibility(nvrhi::ShaderType::AllRayTracing)
@@ -1051,7 +1386,7 @@ void VulkanRenderer::createShaders()
 
 void VulkanRenderer::createPipeline()
 {
-    if (!gBufferFramebuffer_ || framebuffers_.empty()) {
+    if (!gBufferFramebuffer_ || !shadowFramebuffer_ || framebuffers_.empty()) {
         throw std::runtime_error("Cannot create Vulkan renderer pipeline without framebuffers");
     }
 
@@ -1076,6 +1411,29 @@ void VulkanRenderer::createPipeline()
 
     if (!geometryPipeline_) {
         throw std::runtime_error("Failed to create NVRHI G-buffer pipeline for Vulkan renderer");
+    }
+
+    nvrhi::RenderState shadowRenderState;
+    shadowRenderState.rasterState.setCullNone();
+    shadowRenderState.depthStencilState.enableDepthTest();
+    shadowRenderState.depthStencilState.enableDepthWrite();
+    shadowRenderState.depthStencilState.setDepthFunc(nvrhi::ComparisonFunc::LessOrEqual);
+
+    nvrhi::GraphicsPipelineDesc shadowDepthPipelineDesc;
+    shadowDepthPipelineDesc
+        .setPrimType(nvrhi::PrimitiveType::TriangleList)
+        .setInputLayout(shadowInputLayout_)
+        .setVertexShader(shadowDepthVertexShader_)
+        .setFragmentShader(shadowDepthFragmentShader_)
+        .setRenderState(shadowRenderState)
+        .addBindingLayout(shadowDepthBindingLayout_);
+
+    shadowDepthPipeline_ = device_->nvrhiDevice()->createGraphicsPipeline(
+        shadowDepthPipelineDesc,
+        shadowFramebuffer_->getFramebufferInfo());
+
+    if (!shadowDepthPipeline_) {
+        throw std::runtime_error("Failed to create NVRHI character shadow pipeline for Vulkan renderer");
     }
 
     nvrhi::RenderState lightingRenderState;
@@ -1155,8 +1513,13 @@ void VulkanRenderer::createPipeline()
         .setComputeShader(waterOceanComputeShader_)
         .addBindingLayout(waterOceanBindingLayout_));
 
+    skinMeshPipeline_ = device_->nvrhiDevice()->createComputePipeline(nvrhi::ComputePipelineDesc()
+        .setComputeShader(skinMeshComputeShader_)
+        .addBindingLayout(skinMeshBindingLayout_));
+
     if (!skyTransmittancePipeline_ || !skyMultiScatteringPipeline_ ||
-        !skyAtmosphereComputePipeline_ || !cloudDensityPipeline_ || !volumetricCloudsPipeline_ || !waterOceanPipeline_) {
+        !skyAtmosphereComputePipeline_ || !cloudDensityPipeline_ || !volumetricCloudsPipeline_ || !waterOceanPipeline_ ||
+        !skinMeshPipeline_) {
         throw std::runtime_error("Failed to create NVRHI atmosphere compute pipelines for Vulkan renderer");
     }
 
@@ -1197,7 +1560,8 @@ void VulkanRenderer::createBuffers()
         .setByteSize(MaxPrimitiveVertices * sizeof(Vertex))
         .setIsVertexBuffer(true)
         .setIsAccelStructBuildInput(rayTracingEnabled_)
-        .setCanHaveRawViews(rayTracingEnabled_)
+        .setCanHaveRawViews(true)
+        .setCanHaveUAVs(true)
         .setDebugName("PrimitiveVertexBuffer")
         .enableAutomaticStateTracking(nvrhi::ResourceStates::VertexBuffer));
 
@@ -1227,6 +1591,24 @@ void VulkanRenderer::createBuffers()
         .setDebugName("LightingConstants")
         .enableAutomaticStateTracking(nvrhi::ResourceStates::ConstantBuffer));
 
+    meshSourceVertexBuffer_ = device_->nvrhiDevice()->createBuffer(nvrhi::BufferDesc()
+        .setByteSize(MaxPrimitiveVertices * sizeof(Vertex))
+        .setCanHaveRawViews(true)
+        .setDebugName("MeshSourceVertexBuffer")
+        .enableAutomaticStateTracking(nvrhi::ResourceStates::ShaderResource));
+
+    skinningConstantsBuffer_ = device_->nvrhiDevice()->createBuffer(nvrhi::BufferDesc()
+        .setByteSize(sizeof(SkinningConstants))
+        .setIsConstantBuffer(true)
+        .setDebugName("SkinningConstants")
+        .enableAutomaticStateTracking(nvrhi::ResourceStates::ConstantBuffer));
+
+    skinningMatricesBuffer_ = device_->nvrhiDevice()->createBuffer(nvrhi::BufferDesc()
+        .setByteSize(128 * sizeof(glm::mat4))
+        .setCanHaveRawViews(true)
+        .setDebugName("SkinningMatrices")
+        .enableAutomaticStateTracking(nvrhi::ResourceStates::ShaderResource));
+
     lightingSampler_ = device_->nvrhiDevice()->createSampler(nvrhi::SamplerDesc()
         .setAllFilters(false)
         .setAllAddressModes(nvrhi::SamplerAddressMode::Clamp));
@@ -1239,13 +1621,42 @@ void VulkanRenderer::createBuffers()
         .setAddressV(nvrhi::SamplerAddressMode::Clamp)
         .setAddressW(nvrhi::SamplerAddressMode::Wrap));
 
+    geometrySampler_ = device_->nvrhiDevice()->createSampler(nvrhi::SamplerDesc()
+        .setAllFilters(true)
+        .setMaxAnisotropy(maxAnisotropy)
+        .setAllAddressModes(nvrhi::SamplerAddressMode::Wrap));
+
+    whiteTexture_ = device_->nvrhiDevice()->createTexture(nvrhi::TextureDesc()
+        .setDimension(nvrhi::TextureDimension::Texture2D)
+        .setWidth(1)
+        .setHeight(1)
+        .setFormat(nvrhi::Format::RGBA8_UNORM)
+        .setDebugName("GeometryWhiteTexture")
+        .enableAutomaticStateTracking(nvrhi::ResourceStates::ShaderResource));
+    whiteTextureDirty_ = true;
+
+    if (!modelBaseColorPixels_.empty()) {
+        modelBaseColorTexture_ = device_->nvrhiDevice()->createTexture(nvrhi::TextureDesc()
+            .setDimension(nvrhi::TextureDimension::Texture2D)
+            .setWidth(modelBaseColorWidth_)
+            .setHeight(modelBaseColorHeight_)
+            .setFormat(nvrhi::Format::RGBA8_UNORM)
+            .setDebugName("ModelBaseColorTexture")
+            .enableAutomaticStateTracking(nvrhi::ResourceStates::ShaderResource));
+        modelBaseColorTextureDirty_ = true;
+    }
+
+    createGeometryBindingSets();
+    createSkinningBindingSet();
+
     pbrLightingBindingSet_ = device_->nvrhiDevice()->createBindingSet(nvrhi::BindingSetDesc()
         .addItem(nvrhi::BindingSetItem::Texture_SRV(0, sampledGBufferPosition()))
         .addItem(nvrhi::BindingSetItem::Texture_SRV(1, sampledGBufferNormal()))
         .addItem(nvrhi::BindingSetItem::Texture_SRV(2, sampledGBufferAlbedo()))
         .addItem(nvrhi::BindingSetItem::Texture_SRV(3, sampledGBufferMaterial()))
         .addItem(nvrhi::BindingSetItem::Sampler(4, lightingSampler_))
-        .addItem(nvrhi::BindingSetItem::ConstantBuffer(5, lightingConstantsBuffer_)),
+        .addItem(nvrhi::BindingSetItem::ConstantBuffer(5, lightingConstantsBuffer_))
+        .addItem(nvrhi::BindingSetItem::Texture_SRV(6, shadowDepthTexture_)),
         pbrLightingBindingLayout_);
 
     antiAliasingBindingSet_ = device_->nvrhiDevice()->createBindingSet(nvrhi::BindingSetDesc()
@@ -1311,7 +1722,9 @@ void VulkanRenderer::createBuffers()
     }
 
     if (!vertexBuffer_ || !indexBuffer_ || !dynamicVertexBuffer_ || !dynamicIndexBuffer_ ||
-        !lightingConstantsBuffer_ || !lightingSampler_ || !cloudSampler_ ||
+        !meshSourceVertexBuffer_ || !skinningConstantsBuffer_ || !skinningMatricesBuffer_ ||
+        !lightingConstantsBuffer_ || !lightingSampler_ || !cloudSampler_ || !geometrySampler_ ||
+        !whiteTexture_ || !geometryWhiteBindingSet_ || !geometryModelBindingSet_ || !skinMeshBindingSet_ ||
         !pbrLightingBindingSet_ || !antiAliasingBindingSet_ || !skyAtmosphereBindingSet_ || !skyTransmittanceBindingSet_ ||
         !skyMultiScatteringBindingSet_ || !skyAtmosphereComputeBindingSet_ || !cloudDensityBindingSet_ ||
         !volumetricCloudsBindingSet_ || !waterOceanBindingSet_ ||
@@ -1320,15 +1733,126 @@ void VulkanRenderer::createBuffers()
     }
 }
 
+void VulkanRenderer::createGeometryBindingSets()
+{
+    if (!device_ || !device_->nvrhiDevice() || !geometryBindingLayout_ || !geometrySampler_ || !whiteTexture_) {
+        return;
+    }
+
+    geometryWhiteBindingSet_ = device_->nvrhiDevice()->createBindingSet(nvrhi::BindingSetDesc()
+        .addItem(nvrhi::BindingSetItem::Texture_SRV(1, whiteTexture_))
+        .addItem(nvrhi::BindingSetItem::Sampler(2, geometrySampler_)),
+        geometryBindingLayout_);
+
+    nvrhi::ITexture* modelTexture = modelBaseColorTexture_ ? modelBaseColorTexture_.Get() : whiteTexture_.Get();
+    geometryModelBindingSet_ = device_->nvrhiDevice()->createBindingSet(nvrhi::BindingSetDesc()
+        .addItem(nvrhi::BindingSetItem::Texture_SRV(1, modelTexture))
+        .addItem(nvrhi::BindingSetItem::Sampler(2, geometrySampler_)),
+        geometryBindingLayout_);
+}
+
+void VulkanRenderer::createSkinningBindingSet()
+{
+    if (!device_ || !device_->nvrhiDevice() || !skinMeshBindingLayout_ ||
+        !skinningConstantsBuffer_ || !meshSourceVertexBuffer_ || !skinningMatricesBuffer_ || !vertexBuffer_) {
+        return;
+    }
+
+    skinMeshBindingSet_ = device_->nvrhiDevice()->createBindingSet(nvrhi::BindingSetDesc()
+        .addItem(nvrhi::BindingSetItem::ConstantBuffer(0, skinningConstantsBuffer_))
+        .addItem(nvrhi::BindingSetItem::RawBuffer_SRV(1, meshSourceVertexBuffer_))
+        .addItem(nvrhi::BindingSetItem::RawBuffer_SRV(2, skinningMatricesBuffer_))
+        .addItem(nvrhi::BindingSetItem::RawBuffer_UAV(3, vertexBuffer_)),
+        skinMeshBindingLayout_);
+    skinningBindingSetDirty_ = false;
+}
+
+void VulkanRenderer::uploadGeometryTextures()
+{
+    if (whiteTextureDirty_ && whiteTexture_) {
+        constexpr uint8_t whitePixel[4] = { 255, 255, 255, 255 };
+        commandList_->writeTexture(whiteTexture_, 0, 0, whitePixel, 4);
+        commandList_->setTextureState(whiteTexture_, nvrhi::AllSubresources, nvrhi::ResourceStates::ShaderResource);
+        commandList_->commitBarriers();
+        whiteTextureDirty_ = false;
+    }
+
+    if (modelBaseColorTextureDirty_ && modelBaseColorTexture_ && !modelBaseColorPixels_.empty()) {
+        commandList_->writeTexture(
+            modelBaseColorTexture_,
+            0,
+            0,
+            modelBaseColorPixels_.data(),
+            static_cast<size_t>(modelBaseColorWidth_) * 4);
+        commandList_->setTextureState(modelBaseColorTexture_, nvrhi::AllSubresources, nvrhi::ResourceStates::ShaderResource);
+        commandList_->commitBarriers();
+        modelBaseColorTextureDirty_ = false;
+    }
+}
+
+void VulkanRenderer::computeMeshFitTransform()
+{
+    meshFitTransform_ = glm::mat4(1.0f);
+    if (!hasMeshAsset_ || meshAsset_.vertices.empty()) {
+        return;
+    }
+
+    glm::vec3 minBounds = meshAsset_.vertices.front().position;
+    glm::vec3 maxBounds = meshAsset_.vertices.front().position;
+    for (const Resources::MeshVertex& vertex : meshAsset_.vertices) {
+        minBounds = glm::min(minBounds, vertex.position);
+        maxBounds = glm::max(maxBounds, vertex.position);
+    }
+
+    const glm::vec3 center = (minBounds + maxBounds) * 0.5f;
+    const float sourceHeight = (std::max)(maxBounds.y - minBounds.y, 0.001f);
+    const float scale = 2.0f / sourceHeight;
+    const glm::vec3 offset { -center.x * scale, -minBounds.y * scale, -center.z * scale };
+    meshFitTransform_ = glm::translate(glm::mat4(1.0f), offset) * glm::scale(glm::mat4(1.0f), glm::vec3(scale));
+}
+
 void VulkanRenderer::rebuildMesh()
 {
     vertices_.clear();
     indices_.clear();
     uploadedIndexCount_ = 0;
-    vertices_.reserve((std::min)(static_cast<size_t>(MaxPrimitiveVertices), primitives_.size() * 12));
-    indices_.reserve((std::min)(static_cast<size_t>(MaxPrimitiveIndices), primitives_.size() * 18));
+    uploadedMeshAssetIndexCount_ = 0;
+    meshAssetIndexCount_ = 0;
+    meshAssetVertexCount_ = 0;
+    const size_t meshVertexCount = hasMeshAsset_ ? meshAsset_.vertices.size() : 0;
+    const size_t meshIndexCount = hasMeshAsset_ ? meshAsset_.indices.size() : 0;
+    vertices_.reserve((std::min)(static_cast<size_t>(MaxPrimitiveVertices), primitives_.size() * 24 + meshVertexCount));
+    indices_.reserve((std::min)(static_cast<size_t>(MaxPrimitiveIndices), primitives_.size() * 36 + meshIndexCount));
 
+    appendMeshAsset();
+    meshAssetIndexCount_ = static_cast<uint32_t>(indices_.size());
+
+    bool warnedAboutPrimitiveBudget = false;
     for (const PrimitiveInstance& primitive : primitives_) {
+        size_t requiredVertices = 24;
+        size_t requiredIndices = 36;
+        if (primitive.type == PrimitiveType::Triangle) {
+            requiredVertices = 4;
+            requiredIndices = 12;
+        } else if (primitive.type == PrimitiveType::Sphere) {
+            requiredVertices = 544;
+            requiredIndices = 3072;
+        }
+
+        if (vertices_.size() + requiredVertices > MaxPrimitiveVertices ||
+            indices_.size() + requiredIndices > MaxPrimitiveIndices) {
+            if (!warnedAboutPrimitiveBudget) {
+                MENGINE_WARN(
+                    "[RenderBackend] Static primitive mesh reached buffer budget vertices={}/{} indices={}/{}; remaining primitives are skipped",
+                    vertices_.size(),
+                    MaxPrimitiveVertices,
+                    indices_.size(),
+                    MaxPrimitiveIndices);
+                warnedAboutPrimitiveBudget = true;
+            }
+            break;
+        }
+
         switch (primitive.type) {
         case PrimitiveType::Triangle:
             appendTriangle(primitive);
@@ -1450,6 +1974,33 @@ void VulkanRenderer::dispatchWaterOceanCompute()
     commandList_->dispatch(divideAndRoundUp(width, 8), divideAndRoundUp(height, 8));
 }
 
+void VulkanRenderer::dispatchSkinningCompute()
+{
+    if (!hasMeshAsset_ || meshAssetVertexCount_ == 0 || meshSkinningMatrices_.empty() ||
+        !skinMeshPipeline_ || !skinMeshBindingSet_ || !skinningMatricesDirty_) {
+        return;
+    }
+
+    SkinningConstants constants {};
+    const glm::mat4 finalTransform = meshWorldTransform_ * meshFitTransform_;
+    std::copy(glm::value_ptr(finalTransform), glm::value_ptr(finalTransform) + 16, constants.fitTransform);
+    constants.vertexCount = meshAssetVertexCount_;
+    constants.jointCount = static_cast<uint32_t>(meshSkinningMatrices_.size());
+
+    commandList_->writeBuffer(skinningConstantsBuffer_, &constants, sizeof(constants));
+    commandList_->writeBuffer(
+        skinningMatricesBuffer_,
+        meshSkinningMatrices_.data(),
+        meshSkinningMatrices_.size() * sizeof(glm::mat4));
+
+    nvrhi::ComputeState skinningState;
+    skinningState.setPipeline(skinMeshPipeline_);
+    skinningState.addBindingSet(skinMeshBindingSet_);
+    commandList_->setComputeState(skinningState);
+    commandList_->dispatch(divideAndRoundUp(meshAssetVertexCount_, 64), 1, 1);
+    skinningMatricesDirty_ = false;
+}
+
 void VulkanRenderer::rebuildRayTracingAccelerationStructures()
 {
     if (!rayTracingEnabled_ || !rayTracingAccelerationStructuresDirty_) {
@@ -1542,6 +2093,24 @@ void VulkanRenderer::dispatchRayTracingPrototype()
         .setDimensions(swapchain_->extent().width, swapchain_->extent().height));
 }
 
+glm::mat4 VulkanRenderer::buildShadowViewProjection() const
+{
+    const glm::vec3 actorPosition = glm::vec3(meshWorldTransform_[3]);
+    const glm::vec3 shadowCenter = actorPosition + glm::vec3(0.0f, 1.0f, 0.0f);
+    const glm::vec3 lightDirection = glm::normalize(glm::vec3(sunDirection_[0], sunDirection_[1], sunDirection_[2]));
+    const glm::vec3 up = std::abs(glm::dot(lightDirection, glm::vec3(0.0f, 1.0f, 0.0f))) > 0.96f
+        ? glm::vec3(0.0f, 0.0f, 1.0f)
+        : glm::vec3(0.0f, 1.0f, 0.0f);
+
+    const glm::mat4 view = glm::lookAt(
+        shadowCenter - lightDirection * 10.0f,
+        shadowCenter,
+        up);
+    glm::mat4 projection = glm::ortho(-6.0f, 6.0f, -6.0f, 6.0f, 0.1f, 24.0f);
+    projection[1][1] *= -1.0f;
+    return projection * view;
+}
+
 VulkanRenderer::PushConstants VulkanRenderer::buildPushConstants() const
 {
     const float width = static_cast<float>(swapchain_->extent().width);
@@ -1565,6 +2134,19 @@ VulkanRenderer::PushConstants VulkanRenderer::buildPushConstants() const
     constants.materialParameters[0] = materialMetallic_;
     constants.materialParameters[1] = materialRoughness_;
     constants.materialParameters[2] = materialAmbient_;
+    constants.materialParameters[3] = 0.0f;
+    return constants;
+}
+
+VulkanRenderer::PushConstants VulkanRenderer::buildShadowPushConstants() const
+{
+    const glm::mat4 viewProjection = buildShadowViewProjection();
+
+    PushConstants constants {};
+    std::copy(glm::value_ptr(viewProjection), glm::value_ptr(viewProjection) + 16, std::begin(constants.viewProjection));
+    constants.materialParameters[0] = 0.0f;
+    constants.materialParameters[1] = 0.0f;
+    constants.materialParameters[2] = 0.0f;
     constants.materialParameters[3] = 0.0f;
     return constants;
 }
@@ -1652,6 +2234,16 @@ VulkanRenderer::LightingConstants VulkanRenderer::buildLightingConstants() const
     constants.cameraParameters[1] = aspect;
     constants.cameraParameters[2] = width;
     constants.cameraParameters[3] = height;
+    const glm::vec3 actorPosition = glm::vec3(meshWorldTransform_[3]);
+    constants.actorShadowParameters[0] = actorPosition.x;
+    constants.actorShadowParameters[1] = actorPosition.y;
+    constants.actorShadowParameters[2] = actorPosition.z;
+    constants.actorShadowParameters[3] = hasMeshAsset_ ? 1.0f : 0.0f;
+    const glm::mat4 shadowViewProjection = buildShadowViewProjection();
+    std::copy(
+        glm::value_ptr(shadowViewProjection),
+        glm::value_ptr(shadowViewProjection) + 16,
+        std::begin(constants.shadowLightViewProjection));
     return constants;
 }
 
@@ -1837,6 +2429,11 @@ void VulkanRenderer::applyPendingTextureFilteringSettings()
 
 void VulkanRenderer::drawPrimitivePanel()
 {
+    drawEditorTopBar();
+    if (editorPlayMode_) {
+        return;
+    }
+
     ImGui::SetNextWindowPos(ImVec2(12.0f, 12.0f), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(260.0f, 0.0f), ImGuiCond_FirstUseEver);
     ImGui::Begin("Vulkan Renderer");
@@ -1887,7 +2484,33 @@ void VulkanRenderer::drawPrimitivePanel()
 
     ImGui::Separator();
     ImGui::Text("Interaction");
+    ImGui::Checkbox("Player Control", &playerControlModeEnabled_);
     ImGui::Checkbox("Shooting Mode", &shootingModeEnabled_);
+    if (ImGui::Button("Reset Player Spawn")) {
+        playerResetRequested_ = true;
+    }
+    ImGui::Checkbox("Animation Editor", &animationEditorOpen_);
+    drawResourcePanel();
+
+    if (animationEditorOpen_) {
+        ImGui::Separator();
+        ImGui::Text("Animation Timing");
+        ImGui::Checkbox("Lock Root Horizontal", &animationTuning_.lockRootHorizontalMotion);
+        if (animationTuning_.lockRootHorizontalMotion) {
+            ImGui::SliderFloat("Root Horizontal Scale", &animationTuning_.rootHorizontalMotionScale, 0.0f, 1.0f, "%.2f");
+        }
+        ImGui::Checkbox("Lock Root Vertical", &animationTuning_.lockRootVerticalMotion);
+        if (animationTuning_.lockRootVerticalMotion) {
+            ImGui::SliderFloat("Root Vertical Scale", &animationTuning_.rootVerticalMotionScale, 0.0f, 1.0f, "%.2f");
+        }
+        ImGui::SliderFloat("Jump Start Offset", &animationTuning_.jumpStartOffsetSeconds, 0.0f, 0.6f, "%.3fs");
+        ImGui::SliderFloat("Jump Playback", &animationTuning_.jumpPlaybackRate, 0.2f, 2.5f, "%.2fx");
+        ImGui::SliderFloat("Jump Hold Time", &animationTuning_.jumpHoldNormalizedTime, 0.2f, 0.98f, "%.2f");
+        ImGui::SliderFloat("Jump Blend In", &animationTuning_.jumpBlendInSeconds, 0.0f, 0.25f, "%.3fs");
+        ImGui::SliderFloat("Landing Blend", &animationTuning_.landingBlendSeconds, 0.0f, 0.7f, "%.3fs");
+        ImGui::SliderFloat("Locomotion Blend", &animationTuning_.locomotionBlendSeconds, 0.0f, 0.35f, "%.3fs");
+        ImGui::SliderFloat("Physical Jump Delay", &animationTuning_.physicalJumpDelaySeconds, 0.0f, 5.0f, "%.3fs");
+    }
 
     if (ImGui::Button("Add Triangle")) {
         addPrimitive(PrimitiveType::Triangle);
@@ -1969,6 +2592,206 @@ void VulkanRenderer::drawPrimitivePanel()
     }
 
     ImGui::End();
+}
+
+void VulkanRenderer::drawEditorTopBar()
+{
+    ImGuiIO& io = ImGui::GetIO();
+    ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x, 34.0f), ImGuiCond_Always);
+    ImGui::Begin("MeowEngine Top Bar", nullptr,
+        ImGuiWindowFlags_NoDecoration |
+        ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoResize |
+        ImGuiWindowFlags_NoSavedSettings);
+
+    if (!editorPlayMode_) {
+        if (ImGui::Button("Play")) {
+            playRequested_ = true;
+            setEditorPlayMode(true);
+        }
+        ImGui::SameLine();
+        ImGui::Text("Model: %s", modelDisplayName_[0] ? modelDisplayName_ : "Unnamed");
+    } else {
+        ImGui::Text("Play Mode - Esc to exit");
+    }
+
+    ImGui::End();
+}
+
+namespace {
+
+std::filesystem::path modelResourceDirectory()
+{
+    const std::filesystem::path candidates[] {
+        "MEngine/Resources/Model",
+        "../../MEngine/Resources/Model",
+        "../../../MEngine/Resources/Model",
+    };
+    for (const std::filesystem::path& candidate : candidates) {
+        if (std::filesystem::exists(candidate)) {
+            return candidate;
+        }
+    }
+    std::filesystem::create_directories(candidates[0]);
+    return candidates[0];
+}
+
+std::filesystem::path modelMetadataPath(const std::string& modelPath)
+{
+    return std::filesystem::path(modelPath).concat(".meta");
+}
+
+AnimationSystem::AnimationTuning toAnimationTuning(const Resources::MeshAnimationTuning& source)
+{
+    AnimationSystem::AnimationTuning tuning {};
+    tuning.lockRootHorizontalMotion = source.lockRootHorizontalMotion;
+    tuning.lockRootVerticalMotion = source.lockRootVerticalMotion;
+    tuning.rootHorizontalMotionScale = source.rootHorizontalMotionScale;
+    tuning.rootVerticalMotionScale = source.rootVerticalMotionScale;
+    tuning.jumpStartOffsetSeconds = source.jumpStartOffsetSeconds;
+    tuning.jumpPlaybackRate = source.jumpPlaybackRate;
+    tuning.jumpHoldNormalizedTime = source.jumpHoldNormalizedTime;
+    tuning.jumpBlendInSeconds = source.jumpBlendInSeconds;
+    tuning.landingBlendSeconds = source.landingBlendSeconds;
+    tuning.locomotionBlendSeconds = source.locomotionBlendSeconds;
+    tuning.physicalJumpDelaySeconds = source.physicalJumpDelaySeconds;
+    return tuning;
+}
+
+Resources::MeshAnimationTuning toMeshAnimationTuning(
+    const AnimationSystem::AnimationTuning& source,
+    const char* displayName)
+{
+    Resources::MeshAnimationTuning tuning {};
+    tuning.displayName = displayName ? displayName : "";
+    tuning.lockRootHorizontalMotion = source.lockRootHorizontalMotion;
+    tuning.lockRootVerticalMotion = source.lockRootVerticalMotion;
+    tuning.rootHorizontalMotionScale = source.rootHorizontalMotionScale;
+    tuning.rootVerticalMotionScale = source.rootVerticalMotionScale;
+    tuning.jumpStartOffsetSeconds = source.jumpStartOffsetSeconds;
+    tuning.jumpPlaybackRate = source.jumpPlaybackRate;
+    tuning.jumpHoldNormalizedTime = source.jumpHoldNormalizedTime;
+    tuning.jumpBlendInSeconds = source.jumpBlendInSeconds;
+    tuning.landingBlendSeconds = source.landingBlendSeconds;
+    tuning.locomotionBlendSeconds = source.locomotionBlendSeconds;
+    tuning.physicalJumpDelaySeconds = source.physicalJumpDelaySeconds;
+    return tuning;
+}
+
+} // namespace
+
+void VulkanRenderer::refreshModelResources()
+{
+    modelResourcePaths_.clear();
+    const std::filesystem::path resourceDir = modelResourceDirectory();
+    for (const std::filesystem::directory_entry& entry : std::filesystem::directory_iterator(resourceDir)) {
+        if (entry.is_regular_file() && entry.path().extension() == ".mo") {
+            modelResourcePaths_.push_back(entry.path().string());
+        }
+    }
+    std::sort(modelResourcePaths_.begin(), modelResourcePaths_.end());
+    if (selectedModelResourceIndex_ < 0 && !modelResourcePaths_.empty()) {
+        selectedModelResourceIndex_ = 0;
+        loadSelectedModelMetadata();
+    } else if (selectedModelResourceIndex_ >= static_cast<int>(modelResourcePaths_.size())) {
+        selectedModelResourceIndex_ = static_cast<int>(modelResourcePaths_.size()) - 1;
+    }
+    modelResourcesDirty_ = false;
+}
+
+void VulkanRenderer::loadSelectedModelMetadata()
+{
+    if (selectedModelResourceIndex_ < 0 || selectedModelResourceIndex_ >= static_cast<int>(modelResourcePaths_.size())) {
+        return;
+    }
+
+    const std::string& modelPath = modelResourcePaths_[selectedModelResourceIndex_];
+    const std::string defaultName = std::filesystem::path(modelPath).stem().string();
+    std::strncpy(modelDisplayName_, defaultName.c_str(), sizeof(modelDisplayName_) - 1);
+    modelDisplayName_[sizeof(modelDisplayName_) - 1] = '\0';
+
+    Resources::MeshAsset asset;
+    if (!Resources::loadMeshAsset(modelPath, asset)) {
+        modelMetadataStatus_ = "Metadata load failed";
+        return;
+    }
+
+    if (!asset.animationTuning.displayName.empty()) {
+        std::strncpy(modelDisplayName_, asset.animationTuning.displayName.c_str(), sizeof(modelDisplayName_) - 1);
+        modelDisplayName_[sizeof(modelDisplayName_) - 1] = '\0';
+    }
+    animationTuning_ = toAnimationTuning(asset.animationTuning);
+    modelMetadataStatus_ = "Loaded from .mo";
+}
+
+void VulkanRenderer::saveSelectedModelMetadata()
+{
+    if (selectedModelResourceIndex_ < 0 || selectedModelResourceIndex_ >= static_cast<int>(modelResourcePaths_.size())) {
+        return;
+    }
+
+    const std::string& modelPath = modelResourcePaths_[selectedModelResourceIndex_];
+    Resources::MeshAsset asset;
+    if (!Resources::loadMeshAsset(modelPath, asset)) {
+        modelMetadataStatus_ = "Save failed";
+        return;
+    }
+
+    asset.animationTuning = toMeshAnimationTuning(animationTuning_, modelDisplayName_);
+    if (!Resources::saveMeshAsset(asset, modelPath)) {
+        modelMetadataStatus_ = "Save failed";
+        return;
+    }
+
+    modelMetadataStatus_ = "Saved to .mo";
+}
+
+void VulkanRenderer::drawResourcePanel()
+{
+    if (modelResourcesDirty_) {
+        refreshModelResources();
+    }
+
+    ImGui::Separator();
+    ImGui::Text("Model Resources");
+    if (ImGui::Button("Refresh Models")) {
+        refreshModelResources();
+    }
+    ImGui::Text("Folder: %s", modelResourceDirectory().string().c_str());
+
+    std::string previewText = "None";
+    if (selectedModelResourceIndex_ >= 0 && selectedModelResourceIndex_ < static_cast<int>(modelResourcePaths_.size())) {
+        previewText = std::filesystem::path(modelResourcePaths_[selectedModelResourceIndex_]).filename().string();
+    }
+    if (ImGui::BeginCombo("Model", previewText.c_str())) {
+        for (int i = 0; i < static_cast<int>(modelResourcePaths_.size()); ++i) {
+            const std::string filename = std::filesystem::path(modelResourcePaths_[i]).filename().string();
+            const bool selected = i == selectedModelResourceIndex_;
+            if (ImGui::Selectable(filename.c_str(), selected)) {
+                selectedModelResourceIndex_ = i;
+                loadSelectedModelMetadata();
+            }
+            if (selected) {
+                ImGui::SetItemDefaultFocus();
+            }
+        }
+        ImGui::EndCombo();
+    }
+
+    ImGui::InputText("Model Name", modelDisplayName_, sizeof(modelDisplayName_));
+    if (ImGui::Button("Load Model") && selectedModelResourceIndex_ >= 0 &&
+        selectedModelResourceIndex_ < static_cast<int>(modelResourcePaths_.size())) {
+        pendingModelLoadPath_ = modelResourcePaths_[selectedModelResourceIndex_];
+        loadSelectedModelMetadata();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Save Model Tuning")) {
+        saveSelectedModelMetadata();
+    }
+    if (!modelMetadataStatus_.empty()) {
+        ImGui::Text("%s", modelMetadataStatus_.c_str());
+    }
 }
 
 void VulkanRenderer::appendTriangle(const PrimitiveInstance& primitive)
@@ -2156,6 +2979,39 @@ void VulkanRenderer::appendSphere(const PrimitiveInstance& primitive)
                 a + 1, b0, b0 + 1,
             });
         }
+    }
+}
+
+void VulkanRenderer::appendMeshAsset()
+{
+    if (!hasMeshAsset_) {
+        return;
+    }
+
+    if (vertices_.size() + meshAsset_.vertices.size() > MaxPrimitiveVertices ||
+        indices_.size() + meshAsset_.indices.size() > MaxPrimitiveIndices) {
+        MENGINE_WARN(
+            "[RenderBackend] Skipping mesh asset because it exceeds renderer buffers vertices={} indices={}",
+            meshAsset_.vertices.size(),
+            meshAsset_.indices.size());
+        return;
+    }
+
+    const uint32_t vertexBase = static_cast<uint32_t>(vertices_.size());
+    if (meshRenderVertices_.size() != meshAsset_.vertices.size()) {
+        meshRenderVertices_ = meshAsset_.vertices;
+        const glm::mat3 fitNormalTransform(meshFitTransform_);
+        for (Resources::MeshVertex& vertex : meshRenderVertices_) {
+            vertex.position = glm::vec3(meshFitTransform_ * glm::vec4(vertex.position, 1.0f));
+            vertex.normal = glm::normalize(fitNormalTransform * vertex.normal);
+        }
+    }
+
+    vertices_.insert(vertices_.end(), meshRenderVertices_.begin(), meshRenderVertices_.end());
+    meshAssetVertexCount_ = static_cast<uint32_t>(meshRenderVertices_.size());
+    indices_.reserve(indices_.size() + meshAsset_.indices.size());
+    for (uint32_t index : meshAsset_.indices) {
+        indices_.push_back(vertexBase + index);
     }
 }
 

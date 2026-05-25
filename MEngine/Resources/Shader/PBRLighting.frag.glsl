@@ -8,6 +8,7 @@ layout(binding = 1) uniform texture2D g_Normal;
 layout(binding = 2) uniform texture2D g_Albedo;
 layout(binding = 3) uniform texture2D g_Material;
 layout(binding = 4) uniform sampler g_Sampler;
+layout(binding = 6) uniform texture2D g_CharacterShadow;
 
 layout(binding = 5) uniform LightingConstants
 {
@@ -26,6 +27,8 @@ layout(binding = 5) uniform LightingConstants
     vec4 waterParameters;
     vec4 waterWindParameters;
     vec4 cameraParameters;
+    vec4 actorShadowParameters;
+    mat4 shadowLightViewProjection;
 } lighting;
 
 const float PI = 3.14159265359;
@@ -72,6 +75,99 @@ vec3 evaluatePbrLight(vec3 albedo, float metallic, float roughness, vec3 normal,
     return (diffuse + specular) * radiance * max(dot(normal, lightDirection), 0.0);
 }
 
+float sampleShadowPcf(vec2 shadowUv, float receiverDepth, float bias)
+{
+    vec2 texelSize = vec2(1.0) / vec2(textureSize(sampler2D(g_CharacterShadow, g_Sampler), 0));
+    float shadow = 0.0;
+    float weight = 0.0;
+    for (int y = -2; y <= 2; ++y) {
+        for (int x = -2; x <= 2; ++x) {
+            vec2 sampleUv = shadowUv + vec2(x, y) * texelSize * 1.25;
+            if (sampleUv.x < 0.0 || sampleUv.x > 1.0 || sampleUv.y < 0.0 || sampleUv.y > 1.0) {
+                continue;
+            }
+            float kernelWeight = 1.0 - length(vec2(x, y)) * 0.12;
+            float closestDepth = texture(sampler2D(g_CharacterShadow, g_Sampler), sampleUv).r;
+            shadow += (receiverDepth - bias > closestDepth ? 1.0 : 0.0) * kernelWeight;
+            weight += kernelWeight;
+        }
+    }
+
+    return weight > 0.0 ? shadow / weight : 0.0;
+}
+
+float sampleCharacterShadow(vec3 worldPosition, vec3 normal, vec3 sunLightDirection)
+{
+    if (lighting.actorShadowParameters.w < 0.5) {
+        return 0.0;
+    }
+
+    vec4 shadowClip = lighting.shadowLightViewProjection * vec4(worldPosition, 1.0);
+    if (shadowClip.w <= 0.0) {
+        return 0.0;
+    }
+
+    vec3 shadowCoord = shadowClip.xyz / shadowClip.w;
+    vec2 shadowUv = shadowCoord.xy * 0.5 + 0.5;
+    if (shadowUv.x < 0.0 || shadowUv.x > 1.0 || shadowCoord.z < 0.0 || shadowCoord.z > 1.0) {
+        return 0.0;
+    }
+
+    float normalBias = 1.0 - clamp(dot(normal, sunLightDirection), 0.0, 1.0);
+    float bias = mix(0.0025, 0.009, normalBias);
+    float unflippedShadow = sampleShadowPcf(shadowUv, shadowCoord.z, bias);
+    float flippedShadow = sampleShadowPcf(vec2(shadowUv.x, 1.0 - shadowUv.y), shadowCoord.z, bias);
+    return max(unflippedShadow, flippedShadow);
+}
+
+float sampleProjectedActorShadow(vec3 worldPosition, vec3 normal)
+{
+    if (lighting.actorShadowParameters.w < 0.5 || normal.y < 0.18) {
+        return 0.0;
+    }
+
+    vec3 actorBase = lighting.actorShadowParameters.xyz;
+    vec3 lightRay = normalize(lighting.sunDirection.xyz);
+    if (lightRay.y >= -0.04) {
+        return 0.0;
+    }
+
+    vec2 rayXZ = lightRay.xz;
+    float rayLength = length(rayXZ);
+    vec2 along = rayLength > 0.0001 ? rayXZ / rayLength : vec2(1.0, 0.0);
+    vec2 side = vec2(-along.y, along.x);
+
+    float shadow = 0.0;
+    for (int i = 0; i < 7; ++i) {
+        float normalizedIndex = float(i) / 6.0;
+        float height = mix(0.15, 1.95, normalizedIndex);
+        vec3 casterPoint = actorBase + vec3(0.0, height, 0.0);
+        float t = (worldPosition.y - casterPoint.y) / lightRay.y;
+        if (t <= 0.0) {
+            continue;
+        }
+
+        vec3 projectedPoint = casterPoint + lightRay * t;
+        vec2 delta = worldPosition.xz - projectedPoint.xz;
+        float axial = dot(delta, along);
+        float lateral = dot(delta, side);
+        float torsoWeight = 1.0 - abs(normalizedIndex - 0.46) * 1.35;
+        float width = mix(0.28, 0.72, clamp(torsoWeight, 0.0, 1.0));
+        float lengthScale = mix(0.42, 1.34, normalizedIndex);
+        float footprint = sqrt((lateral * lateral) / (width * width) +
+            (axial * axial) / (lengthScale * lengthScale));
+        float heightWeight = mix(0.72, 1.0, clamp(torsoWeight, 0.0, 1.0));
+        shadow = max(shadow, (1.0 - smoothstep(0.72, 1.14, footprint)) * heightWeight);
+    }
+
+    float contact = 1.0 - smoothstep(0.28, 0.86, distance(worldPosition.xz, actorBase.xz));
+    float contactHeight = 1.0 - smoothstep(0.0, 0.65, abs(worldPosition.y - actorBase.y));
+    float receiverFade = 1.0 - smoothstep(3.8, 7.2, distance(worldPosition.xz, actorBase.xz));
+    float heightFade = 1.0 - smoothstep(0.0, 2.6, actorBase.y - worldPosition.y);
+    float surfaceFade = smoothstep(0.18, 0.72, normal.y);
+    return max(shadow * receiverFade * heightFade * 0.78, contact * contactHeight * 0.48) * surfaceFade;
+}
+
 vec3 evaluateSkyIrradiance(vec3 normal)
 {
     float upward = clamp(normal.y * 0.5 + 0.5, 0.0, 1.0);
@@ -111,8 +207,11 @@ void main()
 
     vec3 color = ambientStrength * albedo * evaluateSkyIrradiance(normal);
     vec3 sunLightDirection = normalize(-lighting.sunDirection.xyz);
+    float characterShadow = max(
+        sampleCharacterShadow(worldPosition, normal, sunLightDirection),
+        sampleProjectedActorShadow(worldPosition, normal));
     color += evaluatePbrLight(albedo, metallic, roughness, normal, viewDirection, sunLightDirection,
-        lighting.sunColorAndIntensity.rgb * lighting.sunColorAndIntensity.a);
+        lighting.sunColorAndIntensity.rgb * lighting.sunColorAndIntensity.a) * (1.0 - characterShadow * 0.88);
 
     int lightCount = int(clamp(lighting.pointLightCount.x, 0.0, 4.0));
     for (int i = 0; i < lightCount; ++i) {
@@ -123,6 +222,8 @@ void main()
         vec3 radiance = lighting.pointLightColorAndIntensity[i].rgb * lighting.pointLightColorAndIntensity[i].a * attenuation;
         color += evaluatePbrLight(albedo, metallic, roughness, normal, viewDirection, lightDirection, radiance);
     }
+
+    color *= 1.0 - characterShadow * 0.16;
 
     if (cameraUnderwater && fragmentUnderwater) {
         float viewDistance = length(worldPosition - lighting.cameraPosition.xyz);

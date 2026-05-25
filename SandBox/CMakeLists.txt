@@ -1,4 +1,6 @@
 add_executable(SandBox
+    src/LruCache.hpp
+    src/ModelAssetPreprocessor.cpp
     src/PrimitiveWorld.cpp
     src/main.cpp
 )
@@ -31,5 +33,13 @@ target_link_libraries(MeowAssetBaker
         MEngine
         ${MEOW_ASSIMP_TARGET}
 )
+
+if(WIN32)
+    target_link_libraries(MeowAssetBaker
+        PRIVATE
+            windowscodecs
+            ole32
+    )
+endif()
 
 target_compile_features(MeowAssetBaker PRIVATE cxx_std_17)

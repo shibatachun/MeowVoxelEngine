@@ -118,6 +118,19 @@ bool saveMeshAsset(const MeshAsset& asset, const std::string& path)
         }
     }
 
+    const uint32_t embeddedTextureCount = static_cast<uint32_t>(asset.embeddedTextures.size());
+    if (!writeValue(stream, embeddedTextureCount)) {
+        return false;
+    }
+    for (const MeshEmbeddedTexture& texture : asset.embeddedTextures) {
+        if (!writeString(stream, texture.name) ||
+            !writeValue(stream, texture.width) ||
+            !writeValue(stream, texture.height) ||
+            !writeVector(stream, texture.rgba)) {
+            return false;
+        }
+    }
+
     const uint32_t jointCount = static_cast<uint32_t>(asset.skeleton.size());
     if (!writeValue(stream, jointCount)) {
         return false;
@@ -155,6 +168,21 @@ bool saveMeshAsset(const MeshAsset& asset, const std::string& path)
         }
     }
 
+    if (!writeString(stream, asset.animationTuning.displayName) ||
+        !writeValue(stream, asset.animationTuning.lockRootHorizontalMotion) ||
+        !writeValue(stream, asset.animationTuning.lockRootVerticalMotion) ||
+        !writeValue(stream, asset.animationTuning.rootHorizontalMotionScale) ||
+        !writeValue(stream, asset.animationTuning.rootVerticalMotionScale) ||
+        !writeValue(stream, asset.animationTuning.jumpStartOffsetSeconds) ||
+        !writeValue(stream, asset.animationTuning.jumpPlaybackRate) ||
+        !writeValue(stream, asset.animationTuning.jumpHoldNormalizedTime) ||
+        !writeValue(stream, asset.animationTuning.jumpBlendInSeconds) ||
+        !writeValue(stream, asset.animationTuning.landingBlendSeconds) ||
+        !writeValue(stream, asset.animationTuning.locomotionBlendSeconds) ||
+        !writeValue(stream, asset.animationTuning.physicalJumpDelaySeconds)) {
+        return false;
+    }
+
     return stream.good();
 }
 
@@ -168,7 +196,7 @@ bool loadMeshAsset(const std::string& path, MeshAsset& asset)
     uint32_t magic = 0;
     uint32_t version = 0;
     if (!readValue(stream, magic) || !readValue(stream, version) ||
-        magic != MeshAssetMagic || version != MeshAssetVersion) {
+        magic != MeshAssetMagic || version < 2 || version > MeshAssetVersion) {
         return false;
     }
 
@@ -193,6 +221,20 @@ bool loadMeshAsset(const std::string& path, MeshAsset& asset)
             !readString(stream, material.baseColorTexture) ||
             !readString(stream, material.normalTexture) ||
             !readString(stream, material.metallicRoughnessTexture)) {
+            return false;
+        }
+    }
+
+    uint32_t embeddedTextureCount = 0;
+    if (!readValue(stream, embeddedTextureCount)) {
+        return false;
+    }
+    loaded.embeddedTextures.resize(embeddedTextureCount);
+    for (MeshEmbeddedTexture& texture : loaded.embeddedTextures) {
+        if (!readString(stream, texture.name) ||
+            !readValue(stream, texture.width) ||
+            !readValue(stream, texture.height) ||
+            !readVector(stream, texture.rgba)) {
             return false;
         }
     }
@@ -234,6 +276,23 @@ bool loadMeshAsset(const std::string& path, MeshAsset& asset)
                 !readVector(stream, channel.scales)) {
                 return false;
             }
+        }
+    }
+
+    if (version >= 3) {
+        if (!readString(stream, loaded.animationTuning.displayName) ||
+            !readValue(stream, loaded.animationTuning.lockRootHorizontalMotion) ||
+            !readValue(stream, loaded.animationTuning.lockRootVerticalMotion) ||
+            !readValue(stream, loaded.animationTuning.rootHorizontalMotionScale) ||
+            !readValue(stream, loaded.animationTuning.rootVerticalMotionScale) ||
+            !readValue(stream, loaded.animationTuning.jumpStartOffsetSeconds) ||
+            !readValue(stream, loaded.animationTuning.jumpPlaybackRate) ||
+            !readValue(stream, loaded.animationTuning.jumpHoldNormalizedTime) ||
+            !readValue(stream, loaded.animationTuning.jumpBlendInSeconds) ||
+            !readValue(stream, loaded.animationTuning.landingBlendSeconds) ||
+            !readValue(stream, loaded.animationTuning.locomotionBlendSeconds) ||
+            !readValue(stream, loaded.animationTuning.physicalJumpDelaySeconds)) {
+            return false;
         }
     }
 

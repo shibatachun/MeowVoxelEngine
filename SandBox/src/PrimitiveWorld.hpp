@@ -1,11 +1,13 @@
 #pragma once
 
 #include "MEngine/RenderBackend/Primitive.hpp"
+#include "LruCache.hpp"
 
 #include <TaskScheduler.h>
 
 #include <cstdint>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 namespace SandBox {
@@ -14,11 +16,13 @@ struct PrimitiveWorldConfig {
     uint32_t seed = 0;
     int viewDistanceChunks = 3;
     int worldSizeChunks = 4096;
-    int chunkSize = 16;
+    int chunkSize = 20;
     float cellSize = 0.95f;
     float noiseFrequency = 0.052f;
     float heightScale = 22.0f;
     float waterLine = 0.34f;
+    int maxChunkPublishesPerFrame = 2;
+    int cachedChunkCapacity = 192;
 };
 
 struct ChunkCoord {
@@ -28,6 +32,15 @@ struct ChunkCoord {
     [[nodiscard]] bool operator==(const ChunkCoord& other) const
     {
         return x == other.x && z == other.z;
+    }
+};
+
+struct ChunkCoordHash {
+    [[nodiscard]] size_t operator()(const ChunkCoord& coord) const
+    {
+        const uint64_t x = static_cast<uint32_t>(coord.x);
+        const uint64_t z = static_cast<uint32_t>(coord.z);
+        return static_cast<size_t>((x << 32u) ^ z);
     }
 };
 
@@ -57,6 +70,7 @@ public:
     [[nodiscard]] const std::vector<MEngine::RenderBackend::PrimitiveInstance>& visiblePrimitives() const;
     [[nodiscard]] ChunkCoord centerChunk() const;
     [[nodiscard]] int loadedChunkCount() const;
+    [[nodiscard]] bool hasPendingLoad() const;
     [[nodiscard]] const PrimitiveWorldConfig& config() const;
 
 private:
@@ -64,6 +78,7 @@ private:
     [[nodiscard]] bool isInsideWorld(ChunkCoord coord) const;
     void requestVisibleChunks(ChunkCoord center);
     [[nodiscard]] bool publishCompletedRequest();
+    void rebuildVisiblePrimitivesFromCache();
 
     PrimitiveWorldConfig config_;
     PrimitiveWorldGenerator generator_;
@@ -75,6 +90,8 @@ private:
     ChunkCoord requestedCenterChunk_ { 2147483647, 2147483647 };
     ChunkCoord centerChunk_ { 2147483647, 2147483647 };
     int loadedChunkCount_ = 0;
+    LruCache<ChunkCoord, std::vector<MEngine::RenderBackend::PrimitiveInstance>, ChunkCoordHash> loadedChunks_;
+    std::vector<ChunkCoord> visibleChunkCoords_;
     std::vector<MEngine::RenderBackend::PrimitiveInstance> visiblePrimitives_;
 };
 

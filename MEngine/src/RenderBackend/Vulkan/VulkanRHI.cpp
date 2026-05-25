@@ -190,9 +190,62 @@ public:
         }
     }
 
+    void setMeshAsset(const Resources::MeshAsset& asset)
+    {
+        if (renderer) {
+            renderer->setMeshAsset(asset);
+        }
+    }
+
+    void setMeshWorldTransform(const glm::mat4& transform)
+    {
+        if (renderer) {
+            renderer->setMeshWorldTransform(transform);
+        }
+    }
+
+    void setMeshSkinningMatrices(const std::vector<glm::mat4>& matrices)
+    {
+        if (renderer) {
+            renderer->setMeshSkinningMatrices(matrices);
+        }
+    }
+
+    [[nodiscard]] bool playerControlModeEnabled() const
+    {
+        return renderer && renderer->playerControlModeEnabled();
+    }
+
     [[nodiscard]] bool shootingModeEnabled() const
     {
         return renderer && renderer->shootingModeEnabled();
+    }
+
+    [[nodiscard]] AnimationSystem::AnimationTuning animationTuning() const
+    {
+        return renderer ? renderer->animationTuning() : AnimationSystem::AnimationTuning {};
+    }
+
+    bool consumePlayerResetRequested()
+    {
+        return renderer && renderer->consumePlayerResetRequested();
+    }
+
+    bool consumePlayRequested()
+    {
+        return renderer && renderer->consumePlayRequested();
+    }
+
+    bool consumeModelLoadRequested(std::string& outPath)
+    {
+        return renderer && renderer->consumeModelLoadRequested(outPath);
+    }
+
+    void setEditorPlayMode(bool enabled)
+    {
+        if (renderer) {
+            renderer->setEditorPlayMode(enabled);
+        }
     }
 
     [[nodiscard]] nvrhi::DeviceHandle nvrhiDevice() const
@@ -243,9 +296,54 @@ void VulkanRHI::setDynamicPrimitiveInstances(const std::vector<PrimitiveInstance
     impl_->setDynamicPrimitiveInstances(primitives);
 }
 
+void VulkanRHI::setMeshAsset(const Resources::MeshAsset& asset)
+{
+    impl_->setMeshAsset(asset);
+}
+
+void VulkanRHI::setMeshWorldTransform(const glm::mat4& transform)
+{
+    impl_->setMeshWorldTransform(transform);
+}
+
+void VulkanRHI::setMeshSkinningMatrices(const std::vector<glm::mat4>& matrices)
+{
+    impl_->setMeshSkinningMatrices(matrices);
+}
+
+bool VulkanRHI::playerControlModeEnabled() const
+{
+    return impl_->playerControlModeEnabled();
+}
+
 bool VulkanRHI::shootingModeEnabled() const
 {
     return impl_->shootingModeEnabled();
+}
+
+AnimationSystem::AnimationTuning VulkanRHI::animationTuning() const
+{
+    return impl_->animationTuning();
+}
+
+bool VulkanRHI::consumePlayerResetRequested()
+{
+    return impl_->consumePlayerResetRequested();
+}
+
+bool VulkanRHI::consumePlayRequested()
+{
+    return impl_->consumePlayRequested();
+}
+
+bool VulkanRHI::consumeModelLoadRequested(std::string& outPath)
+{
+    return impl_->consumeModelLoadRequested(outPath);
+}
+
+void VulkanRHI::setEditorPlayMode(bool enabled)
+{
+    impl_->setEditorPlayMode(enabled);
 }
 
 void VulkanRHI::shutdown()

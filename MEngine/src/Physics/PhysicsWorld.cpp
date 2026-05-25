@@ -155,7 +155,7 @@ void PhysicsWorld::publishCompletedCollisionBake()
     }
 
     terrainCollision_ = collisionBakeFuture_.get();
-    MENGINE_INFO("[Physics] Baked terrain collision nodes={} colliders={}", terrainCollision_.nodeCount(), terrainCollision_.colliderCount());
+    MENGINE_DEBUG("[Physics] Baked terrain collision nodes={} colliders={}", terrainCollision_.nodeCount(), terrainCollision_.colliderCount());
     if (collisionBakeQueued_) {
         scheduleCollisionBake();
     }

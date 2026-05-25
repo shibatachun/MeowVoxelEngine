@@ -26,6 +26,7 @@ public:
     void render(nvrhi::ICommandList* commandList, nvrhi::IFramebuffer* framebuffer, uint32_t width, uint32_t height);
     void shutdown();
     void setPanelCallback(std::function<void()> callback);
+    void setStatsVisible(bool visible) { statsVisible_ = visible; }
 
 private:
     void createFontTexture();
@@ -39,6 +40,7 @@ private:
     SDL_Window* window_ = nullptr;
     uint32_t windowId_ = 0;
     bool eventWatchInstalled_ = false;
+    bool statsVisible_ = true;
     nvrhi::TextureHandle fontTexture_;
     nvrhi::SamplerHandle fontSampler_;
     nvrhi::BindingLayoutHandle bindingLayout_;

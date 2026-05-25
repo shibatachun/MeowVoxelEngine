@@ -130,6 +130,22 @@ struct PrimitiveWorldStreamer::RebuildVisibleChunksTask : enki::ITaskSet {
         m_MinRange = 1;
     }
 
+    RebuildVisibleChunksTask(
+        PrimitiveWorldConfig config,
+        PrimitiveWorldGenerator generator,
+        ChunkCoord center,
+        std::vector<ChunkCoord> missingChunks)
+        : enki::ITaskSet(1)
+        , config(std::move(config))
+        , generator(std::move(generator))
+        , center(center)
+        , chunkCoords(std::move(missingChunks))
+    {
+        chunkResults.resize(chunkCoords.size());
+        m_SetSize = static_cast<uint32_t>(chunkCoords.size());
+        m_MinRange = 1;
+    }
+
     void ExecuteRange(enki::TaskSetPartition range, uint32_t) override
     {
         for (uint32_t index = range.start; index < range.end; ++index) {
@@ -254,6 +270,7 @@ float PrimitiveWorldGenerator::noise(float x, float z) const
 PrimitiveWorldStreamer::PrimitiveWorldStreamer(PrimitiveWorldConfig config)
     : config_(config)
     , generator_(config.seed)
+    , loadedChunks_(static_cast<size_t>(std::max(config.cachedChunkCapacity, 1)))
 {
     taskScheduler_.Initialize();
 }
@@ -287,7 +304,11 @@ bool PrimitiveWorldStreamer::waitForPendingLoad()
     }
 
     taskScheduler_.WaitforTask(activeTask_.get());
-    return publishCompletedRequest();
+    bool published = false;
+    while (publishCompletedRequest()) {
+        published = true;
+    }
+    return published;
 }
 
 const std::vector<MEngine::RenderBackend::PrimitiveInstance>& PrimitiveWorldStreamer::visiblePrimitives() const
@@ -303,6 +324,11 @@ ChunkCoord PrimitiveWorldStreamer::centerChunk() const
 int PrimitiveWorldStreamer::loadedChunkCount() const
 {
     return loadedChunkCount_;
+}
+
+bool PrimitiveWorldStreamer::hasPendingLoad() const
+{
+    return activeTask_ != nullptr;
 }
 
 const PrimitiveWorldConfig& PrimitiveWorldStreamer::config() const
@@ -327,10 +353,38 @@ bool PrimitiveWorldStreamer::isInsideWorld(ChunkCoord coord) const
 
 void PrimitiveWorldStreamer::requestVisibleChunks(ChunkCoord center)
 {
-    activeTask_ = std::make_unique<RebuildVisibleChunksTask>(config_, generator_, center);
+    const int halfWorld = config_.worldSizeChunks / 2;
+    visibleChunkCoords_.clear();
+    std::vector<ChunkCoord> missingChunks;
+
+    for (int dz = -config_.viewDistanceChunks; dz <= config_.viewDistanceChunks; ++dz) {
+        for (int dx = -config_.viewDistanceChunks; dx <= config_.viewDistanceChunks; ++dx) {
+            const ChunkCoord coord { center.x + dx, center.z + dz };
+            if (coord.x < -halfWorld || coord.x >= halfWorld || coord.z < -halfWorld || coord.z >= halfWorld) {
+                continue;
+            }
+
+            visibleChunkCoords_.push_back(coord);
+            if (!loadedChunks_.find(coord)) {
+                missingChunks.push_back(coord);
+            }
+        }
+    }
+
+    for (const ChunkCoord& coord : visibleChunkCoords_) {
+        loadedChunks_.touch(coord);
+    }
+
+    centerChunk_ = center;
+    requestedCenterChunk_ = center;
+    if (missingChunks.empty()) {
+        rebuildVisiblePrimitivesFromCache();
+        return;
+    }
+
+    activeTask_ = std::make_unique<RebuildVisibleChunksTask>(config_, generator_, center, std::move(missingChunks));
     if (activeTask_->m_SetSize == 0) {
-        visiblePrimitives_.clear();
-        loadedChunkCount_ = 0;
+        rebuildVisiblePrimitivesFromCache();
         centerChunk_ = center;
         activeTask_.reset();
         return;
@@ -346,29 +400,56 @@ bool PrimitiveWorldStreamer::publishCompletedRequest()
     }
 
     taskScheduler_.WaitforTask(activeTask_.get());
-    if (!(activeTask_->center == requestedCenterChunk_)) {
+    if (!(activeTask_->center == centerChunk_)) {
         // Camera moved again while this task was running; discard stale terrain
         // and let update() request the current center on the next pass.
         activeTask_.reset();
         return false;
     }
 
-    size_t primitiveCount = 0;
-    for (const RebuildVisibleChunksTask::ChunkResult& result : activeTask_->chunkResults) {
-        primitiveCount += result.primitives.size();
+    const int publishBudget = std::max(config_.maxChunkPublishesPerFrame, 1);
+    int publishedChunks = 0;
+    while (!activeTask_->chunkResults.empty() && publishedChunks < publishBudget) {
+        RebuildVisibleChunksTask::ChunkResult& result = activeTask_->chunkResults.back();
+        loadedChunks_.put(result.coord, std::move(result.primitives));
+        activeTask_->chunkResults.pop_back();
+        ++publishedChunks;
     }
 
-    std::vector<MEngine::RenderBackend::PrimitiveInstance> loadedPrimitives;
-    loadedPrimitives.reserve(primitiveCount);
-    for (const RebuildVisibleChunksTask::ChunkResult& result : activeTask_->chunkResults) {
-        loadedPrimitives.insert(loadedPrimitives.end(), result.primitives.begin(), result.primitives.end());
+    if (activeTask_->chunkResults.empty()) {
+        activeTask_.reset();
+        rebuildVisiblePrimitivesFromCache();
     }
 
-    visiblePrimitives_ = std::move(loadedPrimitives);
-    loadedChunkCount_ = static_cast<int>(activeTask_->chunkResults.size());
-    centerChunk_ = activeTask_->center;
-    activeTask_.reset();
     return true;
+}
+
+void PrimitiveWorldStreamer::rebuildVisiblePrimitivesFromCache()
+{
+    size_t primitiveCount = 0;
+    loadedChunkCount_ = 0;
+    for (const ChunkCoord& coord : visibleChunkCoords_) {
+        const auto* chunk = loadedChunks_.find(coord);
+        if (!chunk) {
+            continue;
+        }
+
+        primitiveCount += chunk->size();
+        ++loadedChunkCount_;
+    }
+
+    std::vector<MEngine::RenderBackend::PrimitiveInstance> visiblePrimitives;
+    visiblePrimitives.reserve(primitiveCount);
+    for (const ChunkCoord& coord : visibleChunkCoords_) {
+        const auto* chunk = loadedChunks_.find(coord);
+        if (!chunk) {
+            continue;
+        }
+
+        visiblePrimitives.insert(visiblePrimitives.end(), chunk->begin(), chunk->end());
+    }
+
+    visiblePrimitives_ = std::move(visiblePrimitives);
 }
 
 } // namespace SandBox

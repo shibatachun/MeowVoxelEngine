@@ -1,10 +1,12 @@
 #pragma once
 
+#include "MEngine/AnimationSystem/AnimationSystem.hpp"
 #include "MEngine/Camera/Camera.hpp"
 #include "MEngine/RenderBackend/Primitive.hpp"
 #include "MEngine/RenderBackend/Vulkan/VulkanImGuiLayer.hpp"
 #include "MEngine/Resources/MeshAsset.hpp"
 
+#include <glm/glm.hpp>
 #include <nvrhi/nvrhi.h>
 
 #include <chrono>
@@ -38,7 +40,16 @@ public:
     void addPrimitive(BasicPrimitiveType type);
     void setPrimitiveInstances(const std::vector<PrimitiveInstance>& primitives);
     void setDynamicPrimitiveInstances(const std::vector<PrimitiveInstance>& primitives);
+    void setMeshAsset(const Resources::MeshAsset& asset);
+    void setMeshWorldTransform(const glm::mat4& transform);
+    void setMeshSkinningMatrices(const std::vector<glm::mat4>& matrices);
+    [[nodiscard]] bool playerControlModeEnabled() const;
     [[nodiscard]] bool shootingModeEnabled() const;
+    [[nodiscard]] AnimationSystem::AnimationTuning animationTuning() const;
+    bool consumePlayerResetRequested();
+    bool consumePlayRequested();
+    bool consumeModelLoadRequested(std::string& outPath);
+    void setEditorPlayMode(bool enabled);
     void clearPrimitives();
 
 private:
@@ -50,6 +61,15 @@ private:
     struct AntiAliasingConstants {
         float inverseResolutionAndMode[4];
         float temporalParameters[4];
+        float lensFlareSun[4];
+        float lensFlareColor[4];
+    };
+
+    struct SkinningConstants {
+        float fitTransform[16];
+        uint32_t vertexCount = 0;
+        uint32_t jointCount = 0;
+        uint32_t _padding[2] {};
     };
 
     enum class AntiAliasingMode {
@@ -83,16 +103,23 @@ private:
         float waterParameters[4];
         float waterWindParameters[4];
         float cameraParameters[4];
+        float actorShadowParameters[4];
+        float shadowLightViewProjection[16];
     };
 
     void createFramebuffers(VulkanSwapchain& swapchain);
     void createGBufferTextures(VulkanSwapchain& swapchain);
     void createPostProcessTextures(VulkanSwapchain& swapchain);
     void createDepthTexture(VulkanSwapchain& swapchain);
+    void createShadowResources();
     void createAtmosphereTextures(VulkanSwapchain& swapchain);
     void createShaders();
     void createPipeline();
     void createBuffers();
+    void createGeometryBindingSets();
+    void uploadGeometryTextures();
+    void createSkinningBindingSet();
+    void dispatchSkinningCompute();
     void releaseGpuResources();
     void dispatchSkyAtmosphereCompute();
     void dispatchCloudDensityCompute();
@@ -102,9 +129,17 @@ private:
     void dispatchRayTracingPrototype();
     void rebuildMesh();
     void rebuildDynamicMesh();
+    void computeMeshFitTransform();
+    glm::mat4 buildShadowViewProjection() const;
     PushConstants buildPushConstants() const;
+    PushConstants buildShadowPushConstants() const;
     LightingConstants buildLightingConstants() const;
     void drawPrimitivePanel();
+    void drawEditorTopBar();
+    void drawResourcePanel();
+    void refreshModelResources();
+    void loadSelectedModelMetadata();
+    void saveSelectedModelMetadata();
     void applyPendingAntiAliasingMode();
     void applyPendingTextureFilteringSettings();
     uint32_t sampleCountForAntiAliasingMode(AntiAliasingMode mode) const;
@@ -118,11 +153,14 @@ private:
     void appendQuad(const PrimitiveInstance& primitive);
     void appendCube(const PrimitiveInstance& primitive);
     void appendSphere(const PrimitiveInstance& primitive);
+    void appendMeshAsset();
 
     VulkanDevice* device_ = nullptr;
     VulkanSwapchain* swapchain_ = nullptr;
     nvrhi::ShaderHandle geometryVertexShader_;
     nvrhi::ShaderHandle geometryFragmentShader_;
+    nvrhi::ShaderHandle shadowDepthVertexShader_;
+    nvrhi::ShaderHandle shadowDepthFragmentShader_;
     nvrhi::ShaderHandle pbrLightingVertexShader_;
     nvrhi::ShaderHandle pbrLightingFragmentShader_;
     nvrhi::ShaderHandle antiAliasingFragmentShader_;
@@ -134,11 +172,14 @@ private:
     nvrhi::ShaderHandle cloudDensityComputeShader_;
     nvrhi::ShaderHandle volumetricCloudsComputeShader_;
     nvrhi::ShaderHandle waterOceanComputeShader_;
+    nvrhi::ShaderHandle skinMeshComputeShader_;
     nvrhi::ShaderHandle rayTracingRayGenShader_;
     nvrhi::ShaderHandle rayTracingMissShader_;
     nvrhi::ShaderHandle rayTracingClosestHitShader_;
     nvrhi::InputLayoutHandle inputLayout_;
+    nvrhi::InputLayoutHandle shadowInputLayout_;
     nvrhi::GraphicsPipelineHandle geometryPipeline_;
+    nvrhi::GraphicsPipelineHandle shadowDepthPipeline_;
     nvrhi::GraphicsPipelineHandle pbrLightingPipeline_;
     nvrhi::GraphicsPipelineHandle antiAliasingPipeline_;
     nvrhi::GraphicsPipelineHandle skyAtmospherePipeline_;
@@ -148,6 +189,7 @@ private:
     nvrhi::ComputePipelineHandle cloudDensityPipeline_;
     nvrhi::ComputePipelineHandle volumetricCloudsPipeline_;
     nvrhi::ComputePipelineHandle waterOceanPipeline_;
+    nvrhi::ComputePipelineHandle skinMeshPipeline_;
     nvrhi::rt::PipelineHandle rayTracingPipeline_;
     nvrhi::rt::ShaderTableHandle rayTracingShaderTable_;
     nvrhi::rt::AccelStructHandle rayTracingBlas_;
@@ -159,7 +201,11 @@ private:
     nvrhi::BufferHandle dynamicVertexBuffer_;
     nvrhi::BufferHandle dynamicIndexBuffer_;
     nvrhi::BufferHandle lightingConstantsBuffer_;
+    nvrhi::BufferHandle meshSourceVertexBuffer_;
+    nvrhi::BufferHandle skinningConstantsBuffer_;
+    nvrhi::BufferHandle skinningMatricesBuffer_;
     nvrhi::TextureHandle depthTexture_;
+    nvrhi::TextureHandle shadowDepthTexture_;
     nvrhi::TextureHandle gBufferPosition_;
     nvrhi::TextureHandle gBufferNormal_;
     nvrhi::TextureHandle gBufferAlbedo_;
@@ -177,9 +223,13 @@ private:
     nvrhi::TextureHandle volumetricCloudsTexture_;
     nvrhi::TextureHandle waterOceanTexture_;
     nvrhi::TextureHandle rayTracingOutputTexture_;
+    nvrhi::TextureHandle whiteTexture_;
+    nvrhi::TextureHandle modelBaseColorTexture_;
     nvrhi::SamplerHandle lightingSampler_;
     nvrhi::SamplerHandle cloudSampler_;
+    nvrhi::SamplerHandle geometrySampler_;
     nvrhi::BindingLayoutHandle geometryBindingLayout_;
+    nvrhi::BindingLayoutHandle shadowDepthBindingLayout_;
     nvrhi::BindingLayoutHandle pbrLightingBindingLayout_;
     nvrhi::BindingLayoutHandle antiAliasingBindingLayout_;
     nvrhi::BindingLayoutHandle skyAtmosphereBindingLayout_;
@@ -189,8 +239,11 @@ private:
     nvrhi::BindingLayoutHandle cloudDensityBindingLayout_;
     nvrhi::BindingLayoutHandle volumetricCloudsBindingLayout_;
     nvrhi::BindingLayoutHandle waterOceanBindingLayout_;
+    nvrhi::BindingLayoutHandle skinMeshBindingLayout_;
     nvrhi::BindingLayoutHandle rayTracingBindingLayout_;
     nvrhi::BindingSetHandle pbrLightingBindingSet_;
+    nvrhi::BindingSetHandle geometryWhiteBindingSet_;
+    nvrhi::BindingSetHandle geometryModelBindingSet_;
     nvrhi::BindingSetHandle antiAliasingBindingSet_;
     nvrhi::BindingSetHandle skyAtmosphereBindingSet_;
     nvrhi::BindingSetHandle skyTransmittanceBindingSet_;
@@ -199,18 +252,27 @@ private:
     nvrhi::BindingSetHandle cloudDensityBindingSet_;
     nvrhi::BindingSetHandle volumetricCloudsBindingSet_;
     nvrhi::BindingSetHandle waterOceanBindingSet_;
+    nvrhi::BindingSetHandle skinMeshBindingSet_;
     nvrhi::BindingSetHandle rayTracingBindingSet_;
     nvrhi::BindingSetHandle rayTracingCompositeBindingSet_;
     nvrhi::FramebufferHandle gBufferFramebuffer_;
+    nvrhi::FramebufferHandle shadowFramebuffer_;
     nvrhi::FramebufferHandle postFramebuffer_;
     std::vector<nvrhi::FramebufferHandle> framebuffers_;
     std::unique_ptr<VulkanImGuiLayer> imguiLayer_;
     std::vector<PrimitiveInstance> primitives_;
     std::vector<PrimitiveInstance> dynamicPrimitives_;
+    Resources::MeshAsset meshAsset_;
+    bool hasMeshAsset_ = false;
     std::vector<Resources::MeshVertex> vertices_;
     std::vector<uint32_t> indices_;
     std::vector<Resources::MeshVertex> dynamicVertices_;
     std::vector<uint32_t> dynamicIndices_;
+    std::vector<Resources::MeshVertex> meshRenderVertices_;
+    std::vector<glm::mat4> meshSkinningMatrices_;
+    std::vector<uint8_t> modelBaseColorPixels_;
+    glm::mat4 meshFitTransform_ { 1.0f };
+    glm::mat4 meshWorldTransform_ { 1.0f };
     Camera::CameraState camera_;
     PointLight pointLights_[4] {
         { { 0.0f, 2.5f, 1.5f }, { 1.0f, 0.92f, 0.82f }, 30.0f },
@@ -220,11 +282,11 @@ private:
     };
     int activePointLightCount_ = 3;
     float sunDirection_[3] { -0.35f, -0.72f, -0.6f };
-    float sunColor_[3] { 1.0f, 0.93f, 0.78f };
-    float sunIntensity_ = 3.0f;
+    float sunColor_[3] { 1.0f, 0.96f, 0.84f };
+    float sunIntensity_ = 4.35f;
     float skyRayleighScale_ = 1.0f;
-    float skyMieScale_ = 0.45f;
-    float skyExposure_ = 1.0f;
+    float skyMieScale_ = 0.68f;
+    float skyExposure_ = 1.18f;
     float cloudCoverage_ = 0.48f;
     float cloudDensity_ = 0.85f;
     float cloudHeight_ = 24.0f;
@@ -250,14 +312,35 @@ private:
     float anisotropyLevel_ = 8.0f;
     float pendingAnisotropyLevel_ = 8.0f;
     bool shootingModeEnabled_ = false;
+    bool playerControlModeEnabled_ = false;
+    bool playerResetRequested_ = false;
+    bool playRequested_ = false;
+    bool editorPlayMode_ = false;
+    bool modelResourcesDirty_ = true;
+    bool animationEditorOpen_ = false;
+    AnimationSystem::AnimationTuning animationTuning_ {};
+    std::vector<std::string> modelResourcePaths_;
+    int selectedModelResourceIndex_ = -1;
+    char modelDisplayName_[128] {};
+    std::string pendingModelLoadPath_;
+    std::string modelMetadataStatus_;
     bool meshDirty_ = true;
     bool gpuMeshDirty_ = true;
     bool dynamicMeshDirty_ = true;
     bool dynamicGpuMeshDirty_ = true;
+    bool whiteTextureDirty_ = true;
+    bool modelBaseColorTextureDirty_ = false;
+    bool skinningMatricesDirty_ = false;
+    bool skinningBindingSetDirty_ = true;
     bool rayTracingEnabled_ = false;
     bool rayTracingAccelerationStructuresDirty_ = true;
     uint32_t uploadedIndexCount_ = 0;
+    uint32_t meshAssetIndexCount_ = 0;
+    uint32_t meshAssetVertexCount_ = 0;
+    uint32_t uploadedMeshAssetIndexCount_ = 0;
     uint32_t uploadedDynamicIndexCount_ = 0;
+    uint32_t modelBaseColorWidth_ = 1;
+    uint32_t modelBaseColorHeight_ = 1;
     std::chrono::steady_clock::time_point lastCloudUpdateTime_ {};
 };
 

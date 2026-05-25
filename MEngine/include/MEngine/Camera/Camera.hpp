@@ -25,6 +25,8 @@ public:
 
     void initialize(SDL_Window* window);
     void update();
+    void setState(const CameraState& state);
+    void setExternalControlEnabled(bool enabled);
     void shutdown();
 
     [[nodiscard]] const CameraState& state() const;
@@ -43,6 +45,7 @@ private:
     unsigned int windowId_ = 0;
     bool initialized_ = false;
     bool eventWatchInstalled_ = false;
+    bool externalControlEnabled_ = false;
     bool relativeMouseEnabled_ = false;
     float yawRadians_ = -1.57079632679f;
     float pitchRadians_ = -0.2f;

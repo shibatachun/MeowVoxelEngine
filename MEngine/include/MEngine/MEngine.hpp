@@ -1,7 +1,10 @@
 #pragma once
 
 #include "MEngine/Camera/Camera.hpp"
+#include "MEngine/AnimationSystem/AnimationSystem.hpp"
+#include "MEngine/InputSystem/InputSystem.hpp"
 #include "MEngine/RenderBackend/Primitive.hpp"
+#include "MEngine/Resources/MeshAsset.hpp"
 
 #include <memory>
 #include <string>
@@ -32,11 +35,27 @@ public:
     Engine& operator=(const Engine&) = delete;
 
     void initialize();
+    void pollInput();
     void tick(float deltaSeconds);
     [[nodiscard]] const Camera::CameraState& cameraState() const;
     [[nodiscard]] bool shootingModeEnabled() const;
+    [[nodiscard]] bool playerControlModeEnabled() const;
+    bool consumePlayerResetRequested();
+    bool consumePlayRequested();
+    bool consumeModelLoadRequested(std::string& outPath);
+    void setEditorPlayMode(bool enabled);
+    [[nodiscard]] AnimationSystem::AnimationTuning animationTuning() const;
+    [[nodiscard]] const InputSystem::PlayerInputState& playerInput() const;
+    void setCameraState(const Camera::CameraState& state);
+    void setCameraExternalControlEnabled(bool enabled);
+    void setPlayerInputEnabled(bool enabled);
+    void setAnimationState(AnimationSystem::AnimationState state);
     void setPrimitiveWorld(const std::vector<RenderBackend::PrimitiveInstance>& primitives);
+    void setPrimitiveVisualWorld(const std::vector<RenderBackend::PrimitiveInstance>& primitives);
+    void setPrimitiveCollisionWorld(const std::vector<RenderBackend::PrimitiveInstance>& primitives);
     void setInteractivePrimitives(const std::vector<RenderBackend::PrimitiveInstance>& primitives);
+    void setMeshAsset(const Resources::MeshAsset& asset);
+    void setMeshWorldTransform(const float transform[16]);
     void shootPhysicsSphere(const float origin[3], const float direction[3]);
     void shutdown();
 

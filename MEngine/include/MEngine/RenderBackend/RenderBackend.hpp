@@ -1,10 +1,13 @@
 #pragma once
 
+#include "MEngine/AnimationSystem/AnimationSystem.hpp"
 #include "MEngine/Camera/Camera.hpp"
 #include "MEngine/MEngine.hpp"
 #include "MEngine/RenderBackend/Primitive.hpp"
 #include "MEngine/RenderBackend/RHIContext.hpp"
+#include "MEngine/Resources/MeshAsset.hpp"
 
+#include <glm/glm.hpp>
 #include <memory>
 #include <string>
 
@@ -23,7 +26,16 @@ public:
     void endFrame(const MEngine::Camera::CameraState& camera);
     void setPrimitiveInstances(const std::vector<PrimitiveInstance>& primitives);
     void setDynamicPrimitiveInstances(const std::vector<PrimitiveInstance>& primitives);
+    void setMeshAsset(const Resources::MeshAsset& asset);
+    void setMeshWorldTransform(const glm::mat4& transform);
+    void setMeshSkinningMatrices(const std::vector<glm::mat4>& matrices);
+    [[nodiscard]] bool playerControlModeEnabled() const;
     [[nodiscard]] bool shootingModeEnabled() const;
+    [[nodiscard]] AnimationSystem::AnimationTuning animationTuning() const;
+    bool consumePlayerResetRequested();
+    bool consumePlayRequested();
+    bool consumeModelLoadRequested(std::string& outPath);
+    void setEditorPlayMode(bool enabled);
     void shutdown();
 
 private:

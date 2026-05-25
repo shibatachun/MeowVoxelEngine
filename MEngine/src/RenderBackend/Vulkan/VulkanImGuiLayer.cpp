@@ -81,17 +81,19 @@ void VulkanImGuiLayer::render(nvrhi::ICommandList* commandList, nvrhi::IFramebuf
         panelCallback_();
     }
 
-    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 12.0f, 12.0f), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
-    ImGui::SetNextWindowBgAlpha(0.35f);
-    ImGui::Begin("MeowEngine Stats", nullptr,
-        ImGuiWindowFlags_NoDecoration |
-        ImGuiWindowFlags_AlwaysAutoResize |
-        ImGuiWindowFlags_NoSavedSettings |
-        ImGuiWindowFlags_NoFocusOnAppearing |
-        ImGuiWindowFlags_NoNav);
-    ImGui::Text("FPS %.1f", io.Framerate);
-    ImGui::Text("Frame %.3f ms", 1000.0f / (std::max)(io.Framerate, 0.001f));
-    ImGui::End();
+    if (statsVisible_) {
+        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 12.0f, 12.0f), ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+        ImGui::SetNextWindowBgAlpha(0.35f);
+        ImGui::Begin("MeowEngine Stats", nullptr,
+            ImGuiWindowFlags_NoDecoration |
+            ImGuiWindowFlags_AlwaysAutoResize |
+            ImGuiWindowFlags_NoSavedSettings |
+            ImGuiWindowFlags_NoFocusOnAppearing |
+            ImGuiWindowFlags_NoNav);
+        ImGui::Text("FPS %.1f", io.Framerate);
+        ImGui::Text("Frame %.3f ms", 1000.0f / (std::max)(io.Framerate, 0.001f));
+        ImGui::End();
+    }
     ImGui::Render();
 
     ImDrawData* drawData = ImGui::GetDrawData();

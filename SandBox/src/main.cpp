@@ -1,10 +1,14 @@
 #include "MEngine/MEngine.hpp"
 #include "MEngine/Core/Log.hpp"
 #include "MEngine/Windows/Window.hpp"
+#include "ModelAssetPreprocessor.hpp"
 #include "PrimitiveWorld.hpp"
+
 #include <SDL3/SDL.h>
 #include <glm/common.hpp>
 #include <glm/geometric.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/type_ptr.hpp>
 #include <glm/vec3.hpp>
 #include <iostream>
 #include <algorithm>
@@ -22,6 +26,20 @@
 
 namespace {
 
+struct PlayerControllerState {
+    glm::vec3 position { 0.0f, 2.0f, 0.0f };
+    glm::vec3 velocity { 0.0f };
+    float actorYawRadians = 0.0f;
+    float cameraYawRadians = 0.0f;
+    float cameraPitchRadians = -0.34f;
+    float jumpTakeoffTimer = 0.0f;
+    bool jumpTakeoffPending = false;
+    bool grounded = false;
+};
+
+constexpr glm::vec3 PlayerSpawnPosition { 0.0f, 2.0f, 0.0f };
+constexpr float PlayerRadius = 0.42f;
+
 MEngine::GraphicsApi parseGraphicsApi(int argc, char** argv)
 {
     for (int i = 1; i < argc; ++i) {
@@ -37,7 +55,7 @@ MEngine::GraphicsApi parseGraphicsApi(int argc, char** argv)
         }
     }
 
-    return MEngine::GraphicsApi::D3D12;
+    return MEngine::GraphicsApi::Vulkan;
 }
 
 std::optional<uint32_t> parseSeed(int argc, char** argv)
@@ -92,6 +110,30 @@ const char* graphicsApiName(MEngine::GraphicsApi api)
     }
 
     return "Unknown";
+}
+
+float wrapRadians(float radians)
+{
+    constexpr float Pi = 3.14159265358979323846f;
+    constexpr float TwoPi = Pi * 2.0f;
+    while (radians > Pi) {
+        radians -= TwoPi;
+    }
+    while (radians < -Pi) {
+        radians += TwoPi;
+    }
+    return radians;
+}
+
+float moveTowardsAngle(float currentRadians, float targetRadians, float maxDeltaRadians)
+{
+    const float delta = wrapRadians(targetRadians - currentRadians);
+    if (std::abs(delta) <= maxDeltaRadians) {
+        return targetRadians;
+    }
+
+    const float direction = delta >= 0.0f ? 1.0f : -1.0f;
+    return wrapRadians(currentRadians + direction * maxDeltaRadians);
 }
 
 glm::vec3 cameraForward(const MEngine::Camera::CameraState& camera)
@@ -237,11 +279,256 @@ bool tryPlaceBlock(
     return true;
 }
 
+float sampleTerrainTop(
+    const std::vector<MEngine::RenderBackend::PrimitiveInstance>& terrain,
+    const std::vector<MEngine::RenderBackend::PrimitiveInstance>& placedBlocks,
+    glm::vec3 position,
+    float radius,
+    float fallback)
+{
+    float bestTop = fallback;
+    auto testBlock = [&](const MEngine::RenderBackend::PrimitiveInstance& block) {
+        if (block.type != MEngine::RenderBackend::PrimitiveType::Cube) {
+            return;
+        }
+
+        const float half = block.size * 0.5f;
+        const bool overlapsX = position.x + radius >= block.position[0] - half && position.x - radius <= block.position[0] + half;
+        const bool overlapsZ = position.z + radius >= block.position[2] - half && position.z - radius <= block.position[2] + half;
+        if (!overlapsX || !overlapsZ) {
+            return;
+        }
+
+        const float top = block.position[1] + half;
+        if (top <= position.y + 0.5f) {
+            bestTop = std::max(bestTop, top);
+        }
+    };
+
+    for (const auto& block : terrain) {
+        testBlock(block);
+    }
+    for (const auto& block : placedBlocks) {
+        testBlock(block);
+    }
+
+    return bestTop;
+}
+
+void resolvePlayerHorizontalCollisionAxis(
+    PlayerControllerState& player,
+    float axisSign,
+    bool resolveX,
+    const std::vector<MEngine::RenderBackend::PrimitiveInstance>& terrain,
+    const std::vector<MEngine::RenderBackend::PrimitiveInstance>& placedBlocks)
+{
+    constexpr float PlayerHeight = 1.75f;
+    constexpr float SkinWidth = 0.02f;
+
+    auto testBlock = [&](const MEngine::RenderBackend::PrimitiveInstance& block) {
+        if (block.type != MEngine::RenderBackend::PrimitiveType::Cube) {
+            return;
+        }
+
+        const float half = block.size * 0.5f;
+        const float minY = block.position[1] - half;
+        const float maxY = block.position[1] + half;
+        if (player.position.y + PlayerHeight <= minY + SkinWidth || player.position.y >= maxY - SkinWidth) {
+            return;
+        }
+
+        const float minX = block.position[0] - half;
+        const float maxX = block.position[0] + half;
+        const float minZ = block.position[2] - half;
+        const float maxZ = block.position[2] + half;
+
+        if (resolveX) {
+            const bool overlapsZ = player.position.z + PlayerRadius > minZ && player.position.z - PlayerRadius < maxZ;
+            if (!overlapsZ) {
+                return;
+            }
+
+            if (axisSign > 0.0f && player.position.x + PlayerRadius > minX && player.position.x < minX) {
+                player.position.x = minX - PlayerRadius - SkinWidth;
+            } else if (axisSign < 0.0f && player.position.x - PlayerRadius < maxX && player.position.x > maxX) {
+                player.position.x = maxX + PlayerRadius + SkinWidth;
+            }
+        } else {
+            const bool overlapsX = player.position.x + PlayerRadius > minX && player.position.x - PlayerRadius < maxX;
+            if (!overlapsX) {
+                return;
+            }
+
+            if (axisSign > 0.0f && player.position.z + PlayerRadius > minZ && player.position.z < minZ) {
+                player.position.z = minZ - PlayerRadius - SkinWidth;
+            } else if (axisSign < 0.0f && player.position.z - PlayerRadius < maxZ && player.position.z > maxZ) {
+                player.position.z = maxZ + PlayerRadius + SkinWidth;
+            }
+        }
+    };
+
+    for (const auto& block : terrain) {
+        testBlock(block);
+    }
+    for (const auto& block : placedBlocks) {
+        testBlock(block);
+    }
+}
+
+void updatePlayerController(
+    PlayerControllerState& player,
+    float deltaSeconds,
+    float jumpTakeoffDelay,
+    const MEngine::InputSystem::PlayerInputState& inputState,
+    const std::vector<MEngine::RenderBackend::PrimitiveInstance>& terrain,
+    const std::vector<MEngine::RenderBackend::PrimitiveInstance>& placedBlocks)
+{
+    constexpr float MoveSpeed = 4.8f;
+    constexpr float JumpSpeed = 6.2f;
+    constexpr float Gravity = 16.0f;
+    constexpr float MouseSensitivity = 0.0025f;
+    constexpr float GroundTurnSpeedRadians = 7.5f;
+    constexpr float AirTurnSpeedRadians = 4.2f;
+
+    if (!inputState.modifierDown) {
+        player.cameraYawRadians -= inputState.mouseDeltaX * MouseSensitivity;
+        player.cameraPitchRadians -= inputState.mouseDeltaY * MouseSensitivity;
+        player.cameraPitchRadians = std::clamp(player.cameraPitchRadians, -0.95f, 0.18f);
+    }
+
+    glm::vec2 input { inputState.moveRight, inputState.moveForward };
+
+    if (glm::dot(input, input) > 0.001f) {
+        input = glm::normalize(input);
+        const glm::vec3 cameraForward { -std::sin(player.cameraYawRadians), 0.0f, -std::cos(player.cameraYawRadians) };
+        const glm::vec3 cameraRight { std::cos(player.cameraYawRadians), 0.0f, -std::sin(player.cameraYawRadians) };
+        const glm::vec3 moveDirection = glm::normalize(cameraForward * input.y + cameraRight * input.x);
+        const glm::vec3 movement = moveDirection * MoveSpeed * deltaSeconds;
+        player.position.x += movement.x;
+        if (std::abs(movement.x) > 0.0001f) {
+            resolvePlayerHorizontalCollisionAxis(player, movement.x, true, terrain, placedBlocks);
+        }
+        player.position.z += movement.z;
+        if (std::abs(movement.z) > 0.0001f) {
+            resolvePlayerHorizontalCollisionAxis(player, movement.z, false, terrain, placedBlocks);
+        }
+        const float targetActorYaw = std::atan2(-moveDirection.x, -moveDirection.z);
+        const float turnSpeed = player.grounded ? GroundTurnSpeedRadians : AirTurnSpeedRadians;
+        player.actorYawRadians = moveTowardsAngle(
+            player.actorYawRadians,
+            targetActorYaw,
+            turnSpeed * deltaSeconds);
+    }
+
+    if (inputState.jumpPressed && player.grounded && !player.jumpTakeoffPending) {
+        player.jumpTakeoffPending = true;
+        player.jumpTakeoffTimer = std::clamp(jumpTakeoffDelay, 0.0f, 5.0f);
+    }
+
+    if (player.jumpTakeoffPending) {
+        if (!player.grounded) {
+            player.jumpTakeoffPending = false;
+            player.jumpTakeoffTimer = 0.0f;
+        } else {
+            player.jumpTakeoffTimer -= deltaSeconds;
+        }
+    }
+
+    if (player.jumpTakeoffPending && player.jumpTakeoffTimer <= 0.0f && player.grounded) {
+        player.velocity.y = JumpSpeed;
+        player.jumpTakeoffPending = false;
+        player.jumpTakeoffTimer = 0.0f;
+        player.grounded = false;
+    }
+
+    player.velocity.y -= Gravity * deltaSeconds;
+    player.position.y += player.velocity.y * deltaSeconds;
+
+    const float groundTop = sampleTerrainTop(terrain, placedBlocks, player.position, PlayerRadius, -1000.0f);
+    if (player.position.y <= groundTop) {
+        player.position.y = groundTop;
+        player.velocity.y = 0.0f;
+        player.grounded = true;
+    } else {
+        player.grounded = false;
+    }
+}
+
+MEngine::Camera::CameraState makePlayerCamera(const PlayerControllerState& player)
+{
+    MEngine::Camera::CameraState camera {};
+    const glm::vec3 forward {
+        -std::sin(player.cameraYawRadians) * std::cos(player.cameraPitchRadians),
+        std::sin(player.cameraPitchRadians),
+        -std::cos(player.cameraYawRadians) * std::cos(player.cameraPitchRadians)
+    };
+    const glm::vec3 target = player.position + glm::vec3(0.0f, 1.35f, 0.0f);
+    const glm::vec3 position = target - glm::normalize(forward) * 5.2f;
+
+    camera.position[0] = position.x;
+    camera.position[1] = position.y;
+    camera.position[2] = position.z;
+    camera.target[0] = target.x;
+    camera.target[1] = target.y;
+    camera.target[2] = target.z;
+    camera.fovDegrees = 60.0f;
+    camera.nearPlane = 0.1f;
+    camera.farPlane = 100.0f;
+    return camera;
+}
+
+void submitPlayerTransform(MEngine::Engine& engine, const PlayerControllerState& player)
+{
+    const glm::mat4 transform =
+        glm::translate(glm::mat4(1.0f), player.position) *
+        glm::rotate(glm::mat4(1.0f), player.actorYawRadians, glm::vec3(0.0f, 1.0f, 0.0f));
+    engine.setMeshWorldTransform(glm::value_ptr(transform));
+}
+
 void submitVisibleWorld(
     MEngine::Engine& engine,
-    const SandBox::PrimitiveWorldStreamer& worldStreamer)
+    const SandBox::PrimitiveWorldStreamer& worldStreamer,
+    bool updateCollision)
 {
-    engine.setPrimitiveWorld(worldStreamer.visiblePrimitives());
+    engine.setPrimitiveVisualWorld(worldStreamer.visiblePrimitives());
+    if (updateCollision) {
+        engine.setPrimitiveCollisionWorld(worldStreamer.visiblePrimitives());
+    }
+}
+
+void resetPlayerToSpawn(
+    MEngine::Engine& engine,
+    SandBox::PrimitiveWorldStreamer& worldStreamer,
+    PlayerControllerState& player,
+    const std::vector<MEngine::RenderBackend::PrimitiveInstance>& placedBlocks,
+    bool reloadSpawnWorld)
+{
+    if (reloadSpawnWorld && worldStreamer.update(PlayerSpawnPosition.x, PlayerSpawnPosition.z)) {
+        (void)worldStreamer.waitForPendingLoad();
+        submitVisibleWorld(engine, worldStreamer, true);
+    }
+
+    player.position = PlayerSpawnPosition;
+    player.velocity = glm::vec3(0.0f);
+    player.actorYawRadians = 0.0f;
+    player.cameraYawRadians = 0.0f;
+    player.cameraPitchRadians = -0.34f;
+    player.jumpTakeoffTimer = 0.0f;
+    player.jumpTakeoffPending = false;
+    player.grounded = false;
+
+    const glm::vec3 spawnProbe { PlayerSpawnPosition.x, 1000.0f, PlayerSpawnPosition.z };
+    const float groundTop = sampleTerrainTop(
+        worldStreamer.visiblePrimitives(),
+        placedBlocks,
+        spawnProbe,
+        PlayerRadius,
+        PlayerSpawnPosition.y);
+    player.position.y = groundTop;
+    player.grounded = true;
+
+    submitPlayerTransform(engine, player);
+    engine.setCameraState(makePlayerCamera(player));
 }
 
 } // namespace
@@ -280,43 +567,113 @@ int main(int argc, char** argv)
         });
 
         engine.initialize();
+        SandBox::ModelAssetPreprocessor modelPreprocessor;
+        modelPreprocessor.loadDefaultModel(engine);
 
         SandBox::PrimitiveWorldConfig worldConfig {};
         worldConfig.seed = parseSeed(argc, argv).value_or(createRandomSeed());
-        worldConfig.viewDistanceChunks = std::clamp(parseIntOption(argc, argv, "--view-distance").value_or(4), 1, 6);
+        worldConfig.viewDistanceChunks = std::clamp(parseIntOption(argc, argv, "--view-distance").value_or(4), 1, 8);
         worldConfig.worldSizeChunks = std::max(parseIntOption(argc, argv, "--world-chunks").value_or(4096), 16);
+        const int chunkDiameter = worldConfig.viewDistanceChunks * 2 + 1;
+        worldConfig.cachedChunkCapacity = std::max(parseIntOption(argc, argv, "--chunk-cache").value_or(chunkDiameter * chunkDiameter * 3), chunkDiameter * chunkDiameter);
 
         SandBox::PrimitiveWorldStreamer worldStreamer(worldConfig);
         std::vector<MEngine::RenderBackend::PrimitiveInstance> placedBlocks;
+        PlayerControllerState player;
         const MEngine::Camera::CameraState& initialCamera = engine.cameraState();
         (void)worldStreamer.update(initialCamera.position[0], initialCamera.position[2]);
         (void)worldStreamer.waitForPendingLoad();
-        submitVisibleWorld(engine, worldStreamer);
+        submitVisibleWorld(engine, worldStreamer, false);
         engine.setInteractivePrimitives(placedBlocks);
+        resetPlayerToSpawn(engine, worldStreamer, player, placedBlocks, true);
         MENGINE_INFO(
-            "[SandBox] Created async streaming primitive world seed={} worldChunks={}x{} viewDistance={} loadedChunks={} primitives={}",
+            "[SandBox] Created async streaming primitive world seed={} worldChunks={}x{} viewDistance={} chunkCache={} loadedChunks={} primitives={}",
             worldConfig.seed,
             worldConfig.worldSizeChunks,
             worldConfig.worldSizeChunks,
             worldConfig.viewDistanceChunks,
+            worldConfig.cachedChunkCapacity,
             worldStreamer.loadedChunkCount(),
             worldStreamer.visiblePrimitives().size());
 
         constexpr auto frameSleep = std::chrono::milliseconds(16);
         auto lastFrameTime = std::chrono::steady_clock::now();
         bool wasLeftMouseDown = false;
+        bool wasPlayerMode = false;
+        bool playMode = false;
+        bool wasEscapeDown = false;
         while (window.isOpen() && engine.isRunning()) {
             const auto now = std::chrono::steady_clock::now();
             const std::chrono::duration<float> delta = now - lastFrameTime;
             lastFrameTime = now;
 
             window.pollEvents();
+            std::string requestedModelPath;
+            if (engine.consumeModelLoadRequested(requestedModelPath)) {
+                modelPreprocessor.loadModel(engine, requestedModelPath.c_str());
+                submitPlayerTransform(engine, player);
+            }
+            if (engine.consumePlayRequested()) {
+                playMode = true;
+                resetPlayerToSpawn(engine, worldStreamer, player, placedBlocks, true);
+            }
+            const bool escapeDown = SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_ESCAPE] != 0;
+            if (playMode && escapeDown && !wasEscapeDown) {
+                playMode = false;
+                engine.setEditorPlayMode(false);
+                engine.setPlayerInputEnabled(false);
+            }
+            wasEscapeDown = escapeDown;
+
+            const bool playerMode = engine.playerControlModeEnabled();
+            if (playerMode != wasPlayerMode) {
+                engine.setPlayerInputEnabled(playerMode);
+                if (playerMode) {
+                    const MEngine::Camera::CameraState& currentCamera = engine.cameraState();
+                    const glm::vec3 currentForward = cameraForward(currentCamera);
+                    player.cameraYawRadians = std::atan2(-currentForward.x, -currentForward.z);
+                    player.actorYawRadians = player.cameraYawRadians;
+                }
+                wasPlayerMode = playerMode;
+            }
+
+            engine.setCameraExternalControlEnabled(playerMode);
+            engine.pollInput();
+            const bool resetRequested = engine.consumePlayerResetRequested();
+            if (resetRequested || player.position.y < -48.0f) {
+                resetPlayerToSpawn(engine, worldStreamer, player, placedBlocks, true);
+            }
+
+            if (playerMode) {
+                const auto& playerInput = engine.playerInput();
+                updatePlayerController(
+                    player,
+                    delta.count(),
+                    engine.animationTuning().physicalJumpDelaySeconds,
+                    playerInput,
+                    worldStreamer.visiblePrimitives(),
+                    placedBlocks);
+                submitPlayerTransform(engine, player);
+                engine.setCameraState(makePlayerCamera(player));
+                if (!player.grounded || player.jumpTakeoffPending) {
+                    engine.setAnimationState(MEngine::AnimationSystem::AnimationState::Jump);
+                } else if (std::abs(playerInput.moveForward) > 0.01f || std::abs(playerInput.moveRight) > 0.01f) {
+                    engine.setAnimationState(MEngine::AnimationSystem::AnimationState::Forward);
+                } else {
+                    engine.setAnimationState(MEngine::AnimationSystem::AnimationState::Idle);
+                }
+            } else {
+                engine.setAnimationState(MEngine::AnimationSystem::AnimationState::Idle);
+            }
+
             const MEngine::Camera::CameraState& camera = engine.cameraState();
+            const float streamX = playerMode ? player.position.x : camera.position[0];
+            const float streamZ = playerMode ? player.position.z : camera.position[2];
             bool shouldSubmitWorld = false;
-            if (worldStreamer.update(camera.position[0], camera.position[2])) {
+            if (worldStreamer.update(streamX, streamZ)) {
                 shouldSubmitWorld = true;
                 const SandBox::ChunkCoord center = worldStreamer.centerChunk();
-                MENGINE_INFO(
+                MENGINE_DEBUG(
                     "[SandBox] Published async primitive chunks center=({}, {}) loadedChunks={} primitives={}",
                     center.x,
                     center.z,
@@ -324,9 +681,8 @@ int main(int argc, char** argv)
                     worldStreamer.visiblePrimitives().size());
             }
 
-            const bool altDown = (SDL_GetModState() & SDL_KMOD_ALT) != 0;
             const bool leftMouseDown = (SDL_GetMouseState(nullptr, nullptr) & SDL_BUTTON_LMASK) != 0;
-            if (leftMouseDown && !wasLeftMouseDown && !altDown) {
+            if (!playerMode && leftMouseDown && !wasLeftMouseDown && (SDL_GetModState() & SDL_KMOD_ALT) == 0) {
                 const glm::vec3 origin { camera.position[0], camera.position[1], camera.position[2] };
                 const glm::vec3 direction = cameraForward(camera);
                 if (engine.shootingModeEnabled()) {
@@ -340,7 +696,16 @@ int main(int argc, char** argv)
             wasLeftMouseDown = leftMouseDown;
 
             if (shouldSubmitWorld) {
-                submitVisibleWorld(engine, worldStreamer);
+                if (!worldStreamer.hasPendingLoad()) {
+                    submitVisibleWorld(engine, worldStreamer, true);
+                    if (playerMode) {
+                        const float groundTop = sampleTerrainTop(worldStreamer.visiblePrimitives(), placedBlocks, player.position, 0.42f, player.position.y);
+                        if (player.position.y < groundTop) {
+                            player.position.y = groundTop;
+                            player.velocity.y = 0.0f;
+                        }
+                    }
+                }
             }
             engine.tick(delta.count());
         }

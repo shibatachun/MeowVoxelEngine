@@ -10,7 +10,7 @@
 namespace MEngine::Resources {
 
 constexpr uint32_t MeshAssetMagic = 0x574F454Du; // MEOW
-constexpr uint32_t MeshAssetVersion = 1;
+constexpr uint32_t MeshAssetVersion = 3;
 constexpr uint32_t MeshMaxBoneInfluences = 4;
 
 // Renderer-facing vertex layout. Keep this API-neutral so baked assets can be
@@ -40,6 +40,13 @@ struct MeshMaterial {
     std::string baseColorTexture;
     std::string normalTexture;
     std::string metallicRoughnessTexture;
+};
+
+struct MeshEmbeddedTexture {
+    std::string name;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    std::vector<uint8_t> rgba;
 };
 
 struct SkeletonJoint {
@@ -74,14 +81,31 @@ struct AnimationClip {
     std::vector<AnimationChannel> channels;
 };
 
+struct MeshAnimationTuning {
+    std::string displayName;
+    bool lockRootHorizontalMotion = true;
+    bool lockRootVerticalMotion = true;
+    float rootHorizontalMotionScale = 0.0f;
+    float rootVerticalMotionScale = 0.0f;
+    float jumpStartOffsetSeconds = 0.12f;
+    float jumpPlaybackRate = 0.82f;
+    float jumpHoldNormalizedTime = 0.88f;
+    float jumpBlendInSeconds = 0.12f;
+    float landingBlendSeconds = 0.28f;
+    float locomotionBlendSeconds = 0.16f;
+    float physicalJumpDelaySeconds = 0.18f;
+};
+
 struct MeshAsset {
     // Versioned CPU-side representation of a .mo file after import/bake.
     std::vector<MeshVertex> vertices;
     std::vector<uint32_t> indices;
     std::vector<MeshSurface> surfaces;
     std::vector<MeshMaterial> materials;
+    std::vector<MeshEmbeddedTexture> embeddedTextures;
     std::vector<SkeletonJoint> skeleton;
     std::vector<AnimationClip> animations;
+    MeshAnimationTuning animationTuning;
 };
 
 bool saveMeshAsset(const MeshAsset& asset, const std::string& path);

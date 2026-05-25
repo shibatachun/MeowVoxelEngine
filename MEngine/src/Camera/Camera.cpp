@@ -103,6 +103,16 @@ void CameraController::update()
     lastUpdateTime_ = now;
     const float deltaSeconds = std::clamp(delta.count(), 0.0f, 0.1f);
 
+    if (externalControlEnabled_) {
+        pendingMouseDeltaX_ = 0.0f;
+        pendingMouseDeltaY_ = 0.0f;
+        if (relativeMouseEnabled_ && window_) {
+            SDL_SetWindowRelativeMouseMode(window_, false);
+            relativeMouseEnabled_ = false;
+        }
+        return;
+    }
+
     const bool altDown = (SDL_GetModState() & SDL_KMOD_ALT) != 0;
     if (window_ && relativeMouseEnabled_ == altDown) {
         relativeMouseEnabled_ = !altDown;
@@ -176,6 +186,24 @@ void CameraController::shutdown()
 const CameraState& CameraController::state() const
 {
     return state_;
+}
+
+void CameraController::setState(const CameraState& state)
+{
+    state_ = state;
+}
+
+void CameraController::setExternalControlEnabled(bool enabled)
+{
+    externalControlEnabled_ = enabled;
+    if (enabled) {
+        pendingMouseDeltaX_ = 0.0f;
+        pendingMouseDeltaY_ = 0.0f;
+        if (relativeMouseEnabled_ && window_) {
+            SDL_SetWindowRelativeMouseMode(window_, false);
+            relativeMouseEnabled_ = false;
+        }
+    }
 }
 
 float& CameraController::moveSpeed()

@@ -2,6 +2,7 @@
 
 #include "MEngine/Camera/Camera.hpp"
 #include "MEngine/Core/Log.hpp"
+#include "MEngine/RenderBackend/D3D12/D3D12RHI.hpp"
 #include "MEngine/RenderBackend/Vulkan/VulkanRHI.hpp"
 
 #include <nvrhi/nvrhi.h>
@@ -44,7 +45,7 @@ std::unique_ptr<RHIContext> createRHIContext(GraphicsApi graphicsApi)
     case GraphicsApi::Vulkan:
         return std::make_unique<Vulkan::VulkanRHI>();
     case GraphicsApi::D3D12:
-        return nullptr;
+        return std::make_unique<D3D12::D3D12RHI>();
     }
 
     return nullptr;
@@ -117,9 +118,62 @@ void Renderer::setDynamicPrimitiveInstances(const std::vector<PrimitiveInstance>
     }
 }
 
+void Renderer::setMeshAsset(const Resources::MeshAsset& asset)
+{
+    if (initialized_ && rhiContext_) {
+        rhiContext_->setMeshAsset(asset);
+    }
+}
+
+void Renderer::setMeshWorldTransform(const glm::mat4& transform)
+{
+    if (initialized_ && rhiContext_) {
+        rhiContext_->setMeshWorldTransform(transform);
+    }
+}
+
+void Renderer::setMeshSkinningMatrices(const std::vector<glm::mat4>& matrices)
+{
+    if (initialized_ && rhiContext_) {
+        rhiContext_->setMeshSkinningMatrices(matrices);
+    }
+}
+
+bool Renderer::playerControlModeEnabled() const
+{
+    return initialized_ && rhiContext_ && rhiContext_->playerControlModeEnabled();
+}
+
 bool Renderer::shootingModeEnabled() const
 {
     return initialized_ && rhiContext_ && rhiContext_->shootingModeEnabled();
+}
+
+AnimationSystem::AnimationTuning Renderer::animationTuning() const
+{
+    return initialized_ && rhiContext_ ? rhiContext_->animationTuning() : AnimationSystem::AnimationTuning {};
+}
+
+bool Renderer::consumePlayerResetRequested()
+{
+    return initialized_ && rhiContext_ && rhiContext_->consumePlayerResetRequested();
+}
+
+bool Renderer::consumePlayRequested()
+{
+    return initialized_ && rhiContext_ && rhiContext_->consumePlayRequested();
+}
+
+bool Renderer::consumeModelLoadRequested(std::string& outPath)
+{
+    return initialized_ && rhiContext_ && rhiContext_->consumeModelLoadRequested(outPath);
+}
+
+void Renderer::setEditorPlayMode(bool enabled)
+{
+    if (initialized_ && rhiContext_) {
+        rhiContext_->setEditorPlayMode(enabled);
+    }
 }
 
 void Renderer::shutdown()

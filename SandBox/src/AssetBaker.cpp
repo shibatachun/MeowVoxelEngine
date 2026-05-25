@@ -1,18 +1,35 @@
 #include "MEngine/Core/Log.hpp"
 #include "MEngine/Resources/MeshAsset.hpp"
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
+#include <wincodec.h>
+#include <wrl/client.h>
+
 #include <assimp/Importer.hpp>
 #include <assimp/postprocess.h>
 #include <assimp/scene.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 namespace {
+
+struct ImagePixels {
+    uint32_t width = 0;
+    uint32_t height = 0;
+    std::vector<uint8_t> rgba;
+};
 
 glm::mat4 toGlm(const aiMatrix4x4& matrix)
 {
@@ -37,6 +54,306 @@ std::string texturePath(const aiMaterial& material, aiTextureType type)
         return toString(path);
     }
     return {};
+}
+
+std::optional<ImagePixels> loadImagePixels(const std::filesystem::path& path)
+{
+    const HRESULT coInit = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(coInit) && coInit != RPC_E_CHANGED_MODE) {
+        return std::nullopt;
+    }
+
+    Microsoft::WRL::ComPtr<IWICImagingFactory> factory;
+    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
+    if (FAILED(hr)) {
+        return std::nullopt;
+    }
+
+    Microsoft::WRL::ComPtr<IWICBitmapDecoder> decoder;
+    hr = factory->CreateDecoderFromFilename(
+        path.wstring().c_str(),
+        nullptr,
+        GENERIC_READ,
+        WICDecodeMetadataCacheOnLoad,
+        &decoder);
+    if (FAILED(hr)) {
+        return std::nullopt;
+    }
+
+    Microsoft::WRL::ComPtr<IWICBitmapFrameDecode> frame;
+    hr = decoder->GetFrame(0, &frame);
+    if (FAILED(hr)) {
+        return std::nullopt;
+    }
+
+    Microsoft::WRL::ComPtr<IWICFormatConverter> converter;
+    hr = factory->CreateFormatConverter(&converter);
+    if (FAILED(hr)) {
+        return std::nullopt;
+    }
+
+    hr = converter->Initialize(
+        frame.Get(),
+        GUID_WICPixelFormat32bppRGBA,
+        WICBitmapDitherTypeNone,
+        nullptr,
+        0.0,
+        WICBitmapPaletteTypeCustom);
+    if (FAILED(hr)) {
+        return std::nullopt;
+    }
+
+    ImagePixels image;
+    hr = converter->GetSize(&image.width, &image.height);
+    if (FAILED(hr) || image.width == 0 || image.height == 0) {
+        return std::nullopt;
+    }
+
+    image.rgba.resize(static_cast<size_t>(image.width) * image.height * 4);
+    const uint32_t stride = image.width * 4;
+    hr = converter->CopyPixels(nullptr, stride, static_cast<UINT>(image.rgba.size()), image.rgba.data());
+    if (FAILED(hr)) {
+        return std::nullopt;
+    }
+
+    return image;
+}
+
+glm::vec3 sampleImage(const ImagePixels& image, glm::vec2 uv)
+{
+    uv.x = uv.x - std::floor(uv.x);
+    uv.y = uv.y - std::floor(uv.y);
+
+    const uint32_t x = std::min(static_cast<uint32_t>(uv.x * static_cast<float>(image.width)), image.width - 1);
+    const uint32_t y = std::min(static_cast<uint32_t>(uv.y * static_cast<float>(image.height)), image.height - 1);
+    const size_t offset = (static_cast<size_t>(y) * image.width + x) * 4;
+    return {
+        static_cast<float>(image.rgba[offset]) / 255.0f,
+        static_cast<float>(image.rgba[offset + 1]) / 255.0f,
+        static_cast<float>(image.rgba[offset + 2]) / 255.0f,
+    };
+}
+
+std::string normalizedFilename(std::string value)
+{
+    std::replace(value.begin(), value.end(), '\\', '/');
+    const size_t slash = value.find_last_of('/');
+    if (slash != std::string::npos) {
+        value = value.substr(slash + 1);
+    }
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return value;
+}
+
+std::string resolveBakedTexturePath(
+    const std::string& sourcePath,
+    const std::unordered_map<std::string, std::string>& bakedTextures)
+{
+    if (sourcePath.empty()) {
+        return {};
+    }
+
+    const auto it = bakedTextures.find(normalizedFilename(sourcePath));
+    if (it != bakedTextures.end()) {
+        return it->second;
+    }
+
+    return sourcePath;
+}
+
+std::optional<std::filesystem::path> findTextureFile(
+    const std::string& sourcePath,
+    const std::filesystem::path& inputPath,
+    const std::filesystem::path& outputPath)
+{
+    if (sourcePath.empty()) {
+        return std::nullopt;
+    }
+
+    const std::filesystem::path source = sourcePath;
+    const std::string filename = normalizedFilename(source.filename().string());
+    const std::filesystem::path inputDirectory = inputPath.parent_path();
+    const std::filesystem::path outputDirectory = outputPath.parent_path();
+    const std::filesystem::path bakedTextureDirectory = outputDirectory / (outputPath.stem().string() + "_textures");
+
+    std::vector<std::filesystem::path> candidates;
+    candidates.push_back(source);
+    candidates.push_back(inputDirectory / source);
+    candidates.push_back(outputDirectory / source);
+    candidates.push_back(inputDirectory / filename);
+    candidates.push_back(outputDirectory / filename);
+    candidates.push_back(bakedTextureDirectory / filename);
+
+    for (const std::filesystem::path& candidate : candidates) {
+        if (std::filesystem::exists(candidate) && std::filesystem::is_regular_file(candidate)) {
+            return candidate;
+        }
+    }
+
+    return std::nullopt;
+}
+
+std::string embedTextureFile(
+    const std::string& sourcePath,
+    const std::filesystem::path& inputPath,
+    const std::filesystem::path& outputPath,
+    MEngine::Resources::MeshAsset& asset)
+{
+    const std::optional<std::filesystem::path> textureFile = findTextureFile(sourcePath, inputPath, outputPath);
+    if (!textureFile) {
+        return sourcePath;
+    }
+
+    const std::string filename = normalizedFilename(textureFile->filename().string());
+    const std::filesystem::path textureDirectory = outputPath.parent_path() / (outputPath.stem().string() + "_textures");
+    const std::filesystem::path relativeTexturePath = textureDirectory.filename() / filename;
+    const std::string relativeName = relativeTexturePath.generic_string();
+
+    const auto duplicateIt = std::find_if(asset.embeddedTextures.begin(), asset.embeddedTextures.end(), [&](const auto& texture) {
+        return normalizedFilename(texture.name) == normalizedFilename(relativeName);
+    });
+    if (duplicateIt != asset.embeddedTextures.end()) {
+        return relativeName;
+    }
+
+    std::optional<ImagePixels> pixels = loadImagePixels(*textureFile);
+    if (!pixels) {
+        return sourcePath;
+    }
+
+    MEngine::Resources::MeshEmbeddedTexture embedded;
+    embedded.name = relativeName;
+    embedded.width = pixels->width;
+    embedded.height = pixels->height;
+    embedded.rgba = std::move(pixels->rgba);
+    asset.embeddedTextures.push_back(std::move(embedded));
+
+    std::filesystem::create_directories(textureDirectory);
+    std::error_code copyError;
+    const std::filesystem::path debugCopyPath = textureDirectory / filename;
+    if (!std::filesystem::exists(debugCopyPath)) {
+        std::filesystem::copy_file(*textureFile, debugCopyPath, std::filesystem::copy_options::overwrite_existing, copyError);
+    }
+
+    return relativeName;
+}
+
+void embedMaterialTextures(
+    const std::filesystem::path& inputPath,
+    const std::filesystem::path& outputPath,
+    MEngine::Resources::MeshAsset& asset)
+{
+    for (MEngine::Resources::MeshMaterial& material : asset.materials) {
+        material.baseColorTexture = embedTextureFile(material.baseColorTexture, inputPath, outputPath, asset);
+        material.normalTexture = embedTextureFile(material.normalTexture, inputPath, outputPath, asset);
+        material.metallicRoughnessTexture = embedTextureFile(material.metallicRoughnessTexture, inputPath, outputPath, asset);
+    }
+}
+
+std::unordered_map<std::string, std::string> extractEmbeddedTextures(
+    const aiScene& scene,
+    const std::filesystem::path& outputPath,
+    MEngine::Resources::MeshAsset& asset)
+{
+    std::unordered_map<std::string, std::string> bakedTextures;
+    if (scene.mNumTextures == 0) {
+        return bakedTextures;
+    }
+
+    const std::filesystem::path textureDirectory = outputPath.parent_path() / (outputPath.stem().string() + "_textures");
+    std::filesystem::create_directories(textureDirectory);
+
+    for (uint32_t textureIndex = 0; textureIndex < scene.mNumTextures; ++textureIndex) {
+        const aiTexture& texture = *scene.mTextures[textureIndex];
+        std::string filename = texture.mFilename.length > 0
+            ? texture.mFilename.C_Str()
+            : "embedded_texture_" + std::to_string(textureIndex);
+        filename = normalizedFilename(filename);
+
+        const std::string formatHint = texture.achFormatHint[0] != '\0' ? texture.achFormatHint : "png";
+        if (std::filesystem::path(filename).extension().empty()) {
+            filename += "." + formatHint;
+        }
+
+        const std::filesystem::path texturePath = textureDirectory / filename;
+        std::ofstream textureStream(texturePath, std::ios::binary);
+        if (!textureStream) {
+            continue;
+        }
+
+        if (texture.mHeight == 0) {
+            textureStream.write(reinterpret_cast<const char*>(texture.pcData), texture.mWidth);
+        } else {
+            textureStream.write(
+                reinterpret_cast<const char*>(texture.pcData),
+                static_cast<std::streamsize>(texture.mWidth * texture.mHeight * sizeof(aiTexel)));
+        }
+
+        const std::filesystem::path relativeTexturePath = textureDirectory.filename() / texturePath.filename();
+        const std::string relativeName = relativeTexturePath.generic_string();
+        bakedTextures[normalizedFilename(filename)] = relativeName;
+
+        std::optional<ImagePixels> pixels = loadImagePixels(texturePath);
+        if (pixels) {
+            MEngine::Resources::MeshEmbeddedTexture embedded;
+            embedded.name = relativeName;
+            embedded.width = pixels->width;
+            embedded.height = pixels->height;
+            embedded.rgba = std::move(pixels->rgba);
+            asset.embeddedTextures.push_back(std::move(embedded));
+        }
+    }
+
+    return bakedTextures;
+}
+
+void bakeBaseColorTexturesToVertices(MEngine::Resources::MeshAsset& asset, const std::filesystem::path& outputPath)
+{
+    const std::filesystem::path assetDirectory = outputPath.parent_path();
+    std::vector<std::optional<ImagePixels>> baseColorTextures(asset.materials.size());
+
+    for (size_t materialIndex = 0; materialIndex < asset.materials.size(); ++materialIndex) {
+        const std::string& texturePath = asset.materials[materialIndex].baseColorTexture;
+        if (texturePath.empty()) {
+            continue;
+        }
+
+        std::filesystem::path resolvedPath = texturePath;
+        if (resolvedPath.is_relative()) {
+            resolvedPath = assetDirectory / resolvedPath;
+        }
+
+        baseColorTextures[materialIndex] = loadImagePixels(resolvedPath);
+        if (!baseColorTextures[materialIndex]) {
+            std::cerr << "Warning: failed to bake base color texture " << resolvedPath.string() << "\n";
+        }
+    }
+
+    for (const MEngine::Resources::MeshSurface& surface : asset.surfaces) {
+        if (surface.materialIndex >= asset.materials.size()) {
+            continue;
+        }
+
+        const glm::vec3 materialColor = glm::vec3(asset.materials[surface.materialIndex].baseColor);
+        const uint32_t endIndex = std::min<uint32_t>(
+            surface.firstIndex + surface.indexCount,
+            static_cast<uint32_t>(asset.indices.size()));
+
+        for (uint32_t i = surface.firstIndex; i < endIndex; ++i) {
+            const uint32_t vertexIndex = asset.indices[i];
+            if (vertexIndex >= asset.vertices.size()) {
+                continue;
+            }
+
+            glm::vec3 color = materialColor;
+            if (baseColorTextures[surface.materialIndex]) {
+                color *= sampleImage(*baseColorTextures[surface.materialIndex], asset.vertices[vertexIndex].texCoord);
+            }
+            asset.vertices[vertexIndex].color = color;
+        }
+    }
 }
 
 void addBoneWeight(MEngine::Resources::MeshVertex& vertex, uint32_t boneIndex, float weight)
@@ -128,7 +445,10 @@ uint32_t ensureJoint(
     return index;
 }
 
-void bakeMaterials(const aiScene& scene, MEngine::Resources::MeshAsset& asset)
+void bakeMaterials(
+    const aiScene& scene,
+    MEngine::Resources::MeshAsset& asset,
+    const std::unordered_map<std::string, std::string>& bakedTextures)
 {
     // Store material data as references and scalar factors; textures are not
     // copied yet, only their source paths are preserved for the asset database.
@@ -148,12 +468,12 @@ void bakeMaterials(const aiScene& scene, MEngine::Resources::MeshAsset& asset)
         }
         source.Get(AI_MATKEY_METALLIC_FACTOR, material.metallic);
         source.Get(AI_MATKEY_ROUGHNESS_FACTOR, material.roughness);
-        material.baseColorTexture = texturePath(source, aiTextureType_BASE_COLOR);
+        material.baseColorTexture = resolveBakedTexturePath(texturePath(source, aiTextureType_BASE_COLOR), bakedTextures);
         if (material.baseColorTexture.empty()) {
-            material.baseColorTexture = texturePath(source, aiTextureType_DIFFUSE);
+            material.baseColorTexture = resolveBakedTexturePath(texturePath(source, aiTextureType_DIFFUSE), bakedTextures);
         }
-        material.normalTexture = texturePath(source, aiTextureType_NORMALS);
-        material.metallicRoughnessTexture = texturePath(source, aiTextureType_METALNESS);
+        material.normalTexture = resolveBakedTexturePath(texturePath(source, aiTextureType_NORMALS), bakedTextures);
+        material.metallicRoughnessTexture = resolveBakedTexturePath(texturePath(source, aiTextureType_METALNESS), bakedTextures);
         asset.materials.push_back(std::move(material));
     }
 }
@@ -214,7 +534,7 @@ void bakeMeshes(const aiScene& scene, MEngine::Resources::MeshAsset& asset, std:
     }
 }
 
-void bakeAnimations(const aiScene& scene, MEngine::Resources::MeshAsset& asset, const std::unordered_map<std::string, uint32_t>& jointMap)
+void bakeAnimations(const aiScene& scene, MEngine::Resources::MeshAsset& asset, std::unordered_map<std::string, uint32_t>& jointMap)
 {
     // Only channels that target baked skeleton joints are kept; unrelated scene
     // node animation can be added later as a separate scene format.
@@ -229,7 +549,11 @@ void bakeAnimations(const aiScene& scene, MEngine::Resources::MeshAsset& asset, 
             const aiNodeAnim& sourceChannel = *source.mChannels[channelIndex];
             auto jointIt = jointMap.find(sourceChannel.mNodeName.C_Str());
             if (jointIt == jointMap.end()) {
-                continue;
+                const uint32_t jointIndex = ensureJoint(scene, sourceChannel.mNodeName.C_Str(), glm::mat4(1.0f), asset, jointMap);
+                jointIt = jointMap.find(sourceChannel.mNodeName.C_Str());
+                if (jointIt == jointMap.end()) {
+                    jointIt = jointMap.emplace(sourceChannel.mNodeName.C_Str(), jointIndex).first;
+                }
             }
 
             MEngine::Resources::AnimationChannel channel;
@@ -283,7 +607,6 @@ int main(int argc, char** argv)
     const aiScene* scene = importer.ReadFile(
         argv[1],
         aiProcess_Triangulate |
-        aiProcess_JoinIdenticalVertices |
         aiProcess_GenSmoothNormals |
         aiProcess_CalcTangentSpace |
         aiProcess_LimitBoneWeights |
@@ -298,7 +621,11 @@ int main(int argc, char** argv)
 
     MEngine::Resources::MeshAsset asset;
     std::unordered_map<std::string, uint32_t> jointMap;
-    bakeMaterials(*scene, asset);
+    const std::filesystem::path inputPath = argv[1];
+    const std::filesystem::path outputPath = argv[2];
+    const std::unordered_map<std::string, std::string> bakedTextures = extractEmbeddedTextures(*scene, outputPath, asset);
+    bakeMaterials(*scene, asset, bakedTextures);
+    embedMaterialTextures(inputPath, outputPath, asset);
     bakeMeshes(*scene, asset, jointMap);
     bakeAnimations(*scene, asset, jointMap);
 
@@ -312,6 +639,7 @@ int main(int argc, char** argv)
               << " indices=" << asset.indices.size()
               << " surfaces=" << asset.surfaces.size()
               << " joints=" << asset.skeleton.size()
-              << " animations=" << asset.animations.size() << "\n";
+              << " animations=" << asset.animations.size()
+              << " textures=" << asset.embeddedTextures.size() << "\n";
     return 0;
 }
