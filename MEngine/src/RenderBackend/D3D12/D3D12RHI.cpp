@@ -2,6 +2,10 @@
 
 #include "MEngine/Core/Log.hpp"
 
+#include "D3D12ImGuiLayer.hpp"
+#include "D3D12PrimitiveRenderer.hpp"
+#include "D3D12Utils.hpp"
+
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_properties.h>
 #include <SDL3/SDL_video.h>
@@ -9,28 +13,25 @@
 #include <directx/d3d12.h>
 #include <dxgi1_6.h>
 #include <nvrhi/d3d12.h>
-#include <wrl/client.h>
 
 #include <array>
+#include <algorithm>
 #include <cstdint>
+#include <filesystem>
 #include <stdexcept>
 #include <string>
+
+#ifndef MENGINE_SHADER_BINARY_DIR
+#define MENGINE_SHADER_BINARY_DIR "."
+#endif
 
 namespace MEngine::RenderBackend::D3D12 {
 
 namespace {
 
-using Microsoft::WRL::ComPtr;
-
 constexpr uint32_t FramesInFlight = 2;
 constexpr DXGI_FORMAT BackBufferFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
-
-void checkHResult(HRESULT result, const char* operation)
-{
-    if (FAILED(result)) {
-        throw std::runtime_error(std::string(operation) + " failed with HRESULT 0x" + std::to_string(static_cast<uint32_t>(result)));
-    }
-}
+constexpr DXGI_FORMAT DepthBufferFormat = DXGI_FORMAT_D32_FLOAT;
 
 class NvrhiMessageCallback final : public nvrhi::IMessageCallback {
 public:
@@ -86,12 +87,18 @@ public:
         window_ = window;
         hwnd_ = hwnd;
         rayTracingRequested_ = enableRayTracing;
+
         createFactory();
         createDevice();
         createCommandObjects();
         createSwapchain();
         createRenderTargets();
+        createDepthBuffer();
         createNvrhiDevice();
+
+        const std::filesystem::path shaderDir = std::filesystem::u8path(MENGINE_SHADER_BINARY_DIR) / "D3D12";
+        primitiveRenderer_.initialize(device_.Get(), BackBufferFormat, DepthBufferFormat, shaderDir);
+        imguiLayer_.initialize(device_.Get(), commandQueue_.Get(), BackBufferFormat, DepthBufferFormat, FramesInFlight, 64);
 
         MENGINE_INFO("[RenderBackend] D3D12 RHI initialized with {}", adapterName_);
         if (rayTracingRequested_) {
@@ -104,7 +111,7 @@ public:
     {
     }
 
-    void endFrame()
+    void endFrame(const Camera::CameraState* camera)
     {
         if (!device_ || !swapchain_) {
             return;
@@ -117,22 +124,27 @@ public:
         checkHResult(commandList_->Reset(frame.commandAllocator.Get(), nullptr), "ID3D12GraphicsCommandList::Reset");
 
         ID3D12Resource* renderTarget = renderTargets_[frameIndex_].Get();
-        D3D12_RESOURCE_BARRIER toRenderTarget {};
-        toRenderTarget.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        toRenderTarget.Transition.pResource = renderTarget;
-        toRenderTarget.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        toRenderTarget.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-        toRenderTarget.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        const D3D12_RESOURCE_BARRIER toRenderTarget =
+            transitionBarrier(renderTarget, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
         commandList_->ResourceBarrier(1, &toRenderTarget);
 
         const D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvHandle(frameIndex_);
+        const D3D12_CPU_DESCRIPTOR_HANDLE dsv = dsvHeap_->GetCPUDescriptorHandleForHeapStart();
         const float clearColor[] = { 0.04f, 0.055f, 0.075f, 1.0f };
-        commandList_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        commandList_->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
         commandList_->ClearRenderTargetView(rtv, clearColor, 0, nullptr);
+        commandList_->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
 
-        D3D12_RESOURCE_BARRIER toPresent = toRenderTarget;
-        toPresent.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        toPresent.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+        primitiveRenderer_.draw(commandList_.Get(), camera, swapchainWidth_, swapchainHeight_);
+        imguiLayer_.render(
+            commandList_.Get(),
+            swapchainWidth_,
+            swapchainHeight_,
+            primitiveRenderer_.primitiveCount(),
+            primitiveRenderer_.indexCount());
+
+        const D3D12_RESOURCE_BARRIER toPresent =
+            transitionBarrier(renderTarget, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
         commandList_->ResourceBarrier(1, &toPresent);
 
         checkHResult(commandList_->Close(), "ID3D12GraphicsCommandList::Close");
@@ -150,15 +162,28 @@ public:
         }
     }
 
+    void setPrimitiveInstances(const std::vector<PrimitiveInstance>& primitives)
+    {
+        waitForGpuIdle();
+        primitiveRenderer_.setStaticPrimitives(primitives);
+    }
+
+    void setDynamicPrimitiveInstances(const std::vector<PrimitiveInstance>& primitives)
+    {
+        primitiveRenderer_.setDynamicPrimitives(primitives);
+    }
+
     void shutdown()
     {
         if (commandQueue_ && fence_) {
-            for (FrameContext& frame : frames_) {
-                waitForFrame(frame);
-            }
+            waitForGpuIdle();
         }
 
+        imguiLayer_.shutdown();
+        primitiveRenderer_.shutdown();
         nvrhiDevice_ = nullptr;
+        depthBuffer_ = nullptr;
+        dsvHeap_ = nullptr;
         renderTargets_.fill(nullptr);
         swapchain_ = nullptr;
         commandList_ = nullptr;
@@ -194,7 +219,7 @@ private:
     void createFactory()
     {
         UINT flags = 0;
-#if defined(_DEBUG)
+#if defined(_DEBUG) && defined(MENGINE_D3D12_ENABLE_DEBUG_LAYER)
         ComPtr<ID3D12Debug> debugController;
         if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debugController)))) {
             debugController->EnableDebugLayer();
@@ -262,10 +287,12 @@ private:
         int width = 1;
         int height = 1;
         SDL_GetWindowSizeInPixels(window_, &width, &height);
+        swapchainWidth_ = static_cast<uint32_t>((std::max)(width, 1));
+        swapchainHeight_ = static_cast<uint32_t>((std::max)(height, 1));
 
         DXGI_SWAP_CHAIN_DESC1 desc {};
-        desc.Width = static_cast<UINT>(width);
-        desc.Height = static_cast<UINT>(height);
+        desc.Width = swapchainWidth_;
+        desc.Height = swapchainHeight_;
         desc.Format = BackBufferFormat;
         desc.SampleDesc.Count = 1;
         desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -298,6 +325,42 @@ private:
             checkHResult(swapchain_->GetBuffer(i, IID_PPV_ARGS(&renderTargets_[i])), "IDXGISwapChain::GetBuffer");
             device_->CreateRenderTargetView(renderTargets_[i].Get(), nullptr, rtvHandle(i));
         }
+    }
+
+    void createDepthBuffer()
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC heapDesc {};
+        heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+        heapDesc.NumDescriptors = 1;
+        checkHResult(device_->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&dsvHeap_)), "ID3D12Device::CreateDescriptorHeap DSV");
+
+        D3D12_HEAP_PROPERTIES heapProperties {};
+        heapProperties.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+        D3D12_RESOURCE_DESC desc {};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = swapchainWidth_;
+        desc.Height = swapchainHeight_;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.Format = DepthBufferFormat;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+
+        D3D12_CLEAR_VALUE clearValue {};
+        clearValue.Format = DepthBufferFormat;
+        clearValue.DepthStencil.Depth = 1.0f;
+
+        checkHResult(device_->CreateCommittedResource(
+                         &heapProperties,
+                         D3D12_HEAP_FLAG_NONE,
+                         &desc,
+                         D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                         &clearValue,
+                         IID_PPV_ARGS(&depthBuffer_)),
+            "ID3D12Device::CreateCommittedResource depth buffer");
+        device_->CreateDepthStencilView(depthBuffer_.Get(), nullptr, dsvHeap_->GetCPUDescriptorHandleForHeapStart());
     }
 
     void createNvrhiDevice()
@@ -339,6 +402,24 @@ private:
         frame.fenceValue = 0;
     }
 
+    void waitForGpuIdle()
+    {
+        if (!commandQueue_ || !fence_) {
+            return;
+        }
+
+        const uint64_t value = ++fenceValue_;
+        checkHResult(commandQueue_->Signal(fence_.Get(), value), "ID3D12CommandQueue::Signal idle");
+        if (fence_->GetCompletedValue() < value) {
+            checkHResult(fence_->SetEventOnCompletion(value, fenceEvent_), "ID3D12Fence::SetEventOnCompletion idle");
+            WaitForSingleObject(fenceEvent_, INFINITE);
+        }
+
+        for (FrameContext& frame : frames_) {
+            frame.fenceValue = 0;
+        }
+    }
+
     static std::string narrow(const wchar_t* text)
     {
         std::string result;
@@ -357,13 +438,19 @@ private:
     ComPtr<ID3D12CommandQueue> commandQueue_;
     ComPtr<IDXGISwapChain3> swapchain_;
     ComPtr<ID3D12DescriptorHeap> rtvHeap_;
+    ComPtr<ID3D12DescriptorHeap> dsvHeap_;
+    ComPtr<ID3D12Resource> depthBuffer_;
     std::array<ComPtr<ID3D12Resource>, FramesInFlight> renderTargets_;
     std::array<FrameContext, FramesInFlight> frames_;
     ComPtr<ID3D12GraphicsCommandList> commandList_;
     ComPtr<ID3D12Fence> fence_;
     HANDLE fenceEvent_ = nullptr;
     nvrhi::DeviceHandle nvrhiDevice_;
+    D3D12PrimitiveRenderer primitiveRenderer_;
+    D3D12ImGuiLayer imguiLayer_;
     std::string adapterName_;
+    uint32_t swapchainWidth_ = 1;
+    uint32_t swapchainHeight_ = 1;
     uint32_t frameIndex_ = 0;
     uint32_t rtvDescriptorSize_ = 0;
     uint32_t garbageCollectionFrameCounter_ = 0;
@@ -388,8 +475,17 @@ void D3D12RHI::beginFrame()
 
 void D3D12RHI::endFrame(const Camera::CameraState* camera)
 {
-    (void)camera;
-    impl_->endFrame();
+    impl_->endFrame(camera);
+}
+
+void D3D12RHI::setPrimitiveInstances(const std::vector<PrimitiveInstance>& primitives)
+{
+    impl_->setPrimitiveInstances(primitives);
+}
+
+void D3D12RHI::setDynamicPrimitiveInstances(const std::vector<PrimitiveInstance>& primitives)
+{
+    impl_->setDynamicPrimitiveInstances(primitives);
 }
 
 void D3D12RHI::shutdown()

@@ -79,11 +79,13 @@ add_library(imgui STATIC
     ThirdParty/imgui/imgui_draw.cpp
     ThirdParty/imgui/imgui_tables.cpp
     ThirdParty/imgui/imgui_widgets.cpp
+    ThirdParty/imgui/backends/imgui_impl_dx12.cpp
 )
 
 target_include_directories(imgui
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/imgui
+        ${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty/imgui/backends
 )
 
 if(TARGET SDL3-static)

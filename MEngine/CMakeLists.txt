@@ -2,7 +2,10 @@ add_library(MEngine STATIC
     src/MEngine.cpp
     src/Camera/Camera.cpp
     src/RenderBackend/RenderBackend.cpp
+    src/RenderBackend/D3D12/D3D12ImGuiLayer.cpp
+    src/RenderBackend/D3D12/D3D12PrimitiveRenderer.cpp
     src/RenderBackend/D3D12/D3D12RHI.cpp
+    src/RenderBackend/D3D12/D3D12Utils.cpp
     src/RenderBackend/Vulkan/VulkanBuffer.cpp
     src/RenderBackend/Vulkan/VulkanCommandContext.cpp
     src/RenderBackend/Vulkan/VulkanDevice.cpp
@@ -249,6 +252,8 @@ add_dependencies(MEngine MEngineShaders)
 
 if(MENGINE_DXC_EXECUTABLE)
     set(MENGINE_D3D12_SHADER_OUTPUTS
+        ${MENGINE_HLSL_BINARY_DIR}/ForwardPrimitive.vs.cso
+        ${MENGINE_HLSL_BINARY_DIR}/ForwardPrimitive.ps.cso
         ${MENGINE_HLSL_BINARY_DIR}/Primitive.vs.cso
         ${MENGINE_HLSL_BINARY_DIR}/Primitive.ps.cso
         ${MENGINE_HLSL_BINARY_DIR}/Fullscreen.vs.cso
@@ -257,6 +262,22 @@ if(MENGINE_DXC_EXECUTABLE)
         ${MENGINE_HLSL_BINARY_DIR}/ShadowDepth.ps.cso
         ${MENGINE_HLSL_BINARY_DIR}/AntiAliasing.ps.cso
         ${MENGINE_HLSL_BINARY_DIR}/SkinMesh.cs.cso
+    )
+
+    add_custom_command(
+        OUTPUT ${MENGINE_HLSL_BINARY_DIR}/ForwardPrimitive.vs.cso
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${MENGINE_HLSL_BINARY_DIR}
+        COMMAND ${MENGINE_DXC_EXECUTABLE} -T vs_6_0 -E VSMain ${MENGINE_HLSL_SOURCE_DIR}/ForwardPrimitive.hlsl -Fo ${MENGINE_HLSL_BINARY_DIR}/ForwardPrimitive.vs.cso
+        DEPENDS ${MENGINE_HLSL_SOURCE_DIR}/ForwardPrimitive.hlsl
+        VERBATIM
+    )
+
+    add_custom_command(
+        OUTPUT ${MENGINE_HLSL_BINARY_DIR}/ForwardPrimitive.ps.cso
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${MENGINE_HLSL_BINARY_DIR}
+        COMMAND ${MENGINE_DXC_EXECUTABLE} -T ps_6_0 -E PSMain ${MENGINE_HLSL_SOURCE_DIR}/ForwardPrimitive.hlsl -Fo ${MENGINE_HLSL_BINARY_DIR}/ForwardPrimitive.ps.cso
+        DEPENDS ${MENGINE_HLSL_SOURCE_DIR}/ForwardPrimitive.hlsl
+        VERBATIM
     )
 
     add_custom_command(

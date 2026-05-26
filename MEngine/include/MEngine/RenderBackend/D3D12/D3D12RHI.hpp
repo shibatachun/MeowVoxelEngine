@@ -17,6 +17,8 @@ public:
     void initialize(void* nativeWindowHandle, const char* applicationName, bool enableRayTracing) override;
     void beginFrame() override;
     void endFrame(const Camera::CameraState* camera = nullptr) override;
+    void setPrimitiveInstances(const std::vector<PrimitiveInstance>& primitives) override;
+    void setDynamicPrimitiveInstances(const std::vector<PrimitiveInstance>& primitives) override;
     void shutdown() override;
 
     [[nodiscard]] nvrhi::DeviceHandle device() const override;

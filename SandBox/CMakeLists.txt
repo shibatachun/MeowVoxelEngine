@@ -1,7 +1,13 @@
 add_executable(SandBox
+    src/BlockInteraction.cpp
+    src/CameraUtils.cpp
+    src/CommandLineOptions.cpp
     src/LruCache.hpp
     src/ModelAssetPreprocessor.cpp
+    src/PlayerController.cpp
     src/PrimitiveWorld.cpp
+    src/SandboxApplication.cpp
+    src/WorldSubmission.cpp
     src/main.cpp
 )
 
